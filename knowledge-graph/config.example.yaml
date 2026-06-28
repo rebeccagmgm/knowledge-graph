@@ -1,0 +1,16 @@
+# 当前脚本主要通过命令行参数和环境变量读取配置。
+project_id: example_project
+entry_task_ids:
+  - "236334"
+output_root: ./artifacts/projects
+lineage_root: ./artifacts/lineage_batch
+llm:
+  enabled: false
+  provider: mock
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-pro
+neo4j:
+  enabled: false
+  uri: bolt://localhost:7687
+  user: neo4j
+

@@ -1,0 +1,28 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+*.env
+!.env.example
+
+# 凭证与密钥
+*password*
+*cookie*
+*.key
+*.pem
+id_rsa*
+
+# 采集数据、运行日志和生成图谱
+artifacts/
+kg-code-snapshots/
+logs/
+*.log
+*_graph_nodes.jsonl
+*_graph_edges.jsonl
+*_neo4j_import.cypher
+llm/code_definitions.jsonl
+llm/definition_comparisons.jsonl
+

@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Batch import graph JSONL facts into Neo4j and run validation queries."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+
+for LOCAL_USERBASE in [Path(os.environ.get("KG_PYTHON_USERBASE", "vendor"))]:
+    if LOCAL_USERBASE.exists():
+        sys.path.insert(0, str(LOCAL_USERBASE))
+
+from neo4j import GraphDatabase  # noqa: E402
+
+
+SAFE_TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+SCHEMA_STATEMENTS = [
+    "CREATE CONSTRAINT kg_node_id IF NOT EXISTS FOR (n:KGNode) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT dataset_name IF NOT EXISTS FOR (n:Dataset) REQUIRE n.name IS UNIQUE",
+    "CREATE CONSTRAINT schedule_task_id IF NOT EXISTS FOR (n:ScheduleTask) REQUIRE n.task_id IS UNIQUE",
+    "CREATE CONSTRAINT sql_statement_id IF NOT EXISTS FOR (n:SqlStatement) REQUIRE n.statement_id IS UNIQUE",
+    "CREATE CONSTRAINT metric_id IF NOT EXISTS FOR (n:Metric) REQUIRE n.metric_id IS UNIQUE",
+    "CREATE CONSTRAINT owner_name IF NOT EXISTS FOR (n:Owner) REQUIRE n.name IS UNIQUE",
+    "CREATE INDEX dataset_layer IF NOT EXISTS FOR (n:Dataset) ON (n.layer)",
+    "CREATE INDEX dataset_db_name IF NOT EXISTS FOR (n:Dataset) ON (n.db_name)",
+    "CREATE INDEX column_dataset_name IF NOT EXISTS FOR (n:Column) ON (n.dataset, n.name)",
+    "CREATE INDEX column_name IF NOT EXISTS FOR (n:Column) ON (n.name)",
+    "CREATE INDEX task_type IF NOT EXISTS FOR (n:ScheduleTask) ON (n.task_type)",
+    "CREATE INDEX task_layer IF NOT EXISTS FOR (n:ScheduleTask) ON (n.layer)",
+    "CREATE INDEX metric_chinese_name IF NOT EXISTS FOR (n:Metric) ON (n.chinese_name)",
+    "CREATE INDEX metric_english_name IF NOT EXISTS FOR (n:Metric) ON (n.english_name)",
+    "CREATE INDEX fact_build_id IF NOT EXISTS FOR (n:KGNode) ON (n.build_id)",
+    "CREATE INDEX fact_type IF NOT EXISTS FOR (n:KGNode) ON (n.fact_type)",
+]
+
+
+def load_jsonl(path: Path):
+    with path.open() as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
+
+
+def cypher_label(label: str) -> str:
+    if not SAFE_TOKEN.match(label):
+        raise ValueError(f"Unsafe label: {label}")
+    return f"`{label}`"
+
+
+def cypher_rel_type(rel_type: str) -> str:
+    if not SAFE_TOKEN.match(rel_type):
+        raise ValueError(f"Unsafe relationship type: {rel_type}")
+    return f"`{rel_type}`"
+
+
+def chunks(items: list[dict], size: int):
+    for idx in range(0, len(items), size):
+        yield items[idx : idx + size]
+
+
+def neo4j_properties(properties: dict) -> dict:
+    """Convert nested JSON values to deterministic strings accepted by Neo4j."""
+    normalized = {}
+    for key, value in properties.items():
+        if isinstance(value, dict) or (
+            isinstance(value, list)
+            and any(isinstance(item, (dict, list)) for item in value)
+        ):
+            normalized[key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def execute_write_batches(session, query: str, rows: list[dict], batch_size: int) -> int:
+    count = 0
+    for batch in chunks(rows, batch_size):
+        session.run(query, rows=batch).consume()
+        count += len(batch)
+    return count
+
+
+def ensure_schema(session) -> None:
+    for statement in SCHEMA_STATEMENTS:
+        session.run(statement).consume()
+    session.run("CALL db.awaitIndexes()").consume()
+
+
+def import_graph(project_dir: Path, prefix: str, uri: str, user: str, password: str, batch_size: int) -> dict:
+    nodes_path = project_dir / f"{prefix}_graph_nodes.jsonl"
+    edges_path = project_dir / f"{prefix}_graph_edges.jsonl"
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+    started_at = time.time()
+    with driver.session(database="neo4j") as session:
+        session.run("MATCH (n) DETACH DELETE n").consume()
+        ensure_schema(session)
+
+        node_groups: dict[tuple[str, ...], list[dict]] = defaultdict(list)
+        for item in load_jsonl(nodes_path):
+            labels = tuple(sorted(set(item.get("labels", []) + ["KGNode"])))
+            props = neo4j_properties({"id": item["id"], **item.get("properties", {})})
+            node_groups[labels].append({"id": item["id"], "props": props})
+
+        imported_nodes = 0
+        for labels, rows in sorted(node_groups.items(), key=lambda pair: pair[0]):
+            label_clause = ":".join(cypher_label(label) for label in labels)
+            query = f"""
+            UNWIND $rows AS row
+            MERGE (n:KGNode {{id: row.id}})
+            SET n:{label_clause}
+            SET n += row.props
+            """
+            imported_nodes += execute_write_batches(session, query, rows, batch_size)
+
+        edge_groups: dict[str, list[dict]] = defaultdict(list)
+        for item in load_jsonl(edges_path):
+            props = neo4j_properties({"id": item["id"], **item.get("properties", {})})
+            edge_groups[item["type"]].append(
+                {"id": item["id"], "from": item["from"], "to": item["to"], "props": props}
+            )
+
+        imported_edges = 0
+        for rel_type, rows in sorted(edge_groups.items()):
+            rel = cypher_rel_type(rel_type)
+            query = f"""
+            UNWIND $rows AS row
+            MATCH (a:KGNode {{id: row.from}})
+            MATCH (b:KGNode {{id: row.to}})
+            MERGE (a)-[r:{rel} {{id: row.id}}]->(b)
+            SET r += row.props
+            """
+            imported_edges += execute_write_batches(session, query, rows, batch_size)
+
+        session.run("CALL db.awaitIndexes()").consume()
+    driver.close()
+    return {
+        "imported_nodes": imported_nodes,
+        "imported_edges": imported_edges,
+        "elapsed_seconds": round(time.time() - started_at, 2),
+    }
+
+
+def records_to_plain(records):
+    return [dict(record) for record in records]
+
+
+def validate(uri: str, user: str, password: str) -> dict:
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+    with driver.session(database="neo4j") as session:
+        ensure_schema(session)
+        schema_count = session.run("SHOW INDEXES YIELD name RETURN count(name) AS count").single()["count"]
+        node_count = session.run("MATCH (n) RETURN count(n) AS count").single()["count"]
+        edge_count = session.run("MATCH ()-[r]->() RETURN count(r) AS count").single()["count"]
+        label_dist = records_to_plain(
+            session.run(
+                "MATCH (n) UNWIND labels(n) AS label RETURN label, count(*) AS count ORDER BY label"
+            )
+        )
+        rel_dist = records_to_plain(
+            session.run(
+                "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY type"
+            )
+        )
+        missing_endpoints = 0
+        dataset_paths = records_to_plain(
+            session.run(
+                """
+                MATCH (d:Dataset)
+                WHERE d.layer IN ['dm', 'dm_index_n']
+                WITH d
+                ORDER BY size([(d)-[:DATASET_DEPENDS_ON]->() | 1]) DESC
+                LIMIT 20
+                CALL (d) {
+                  MATCH path = (d)-[:DATASET_DEPENDS_ON*1..12]->(src:Dataset)
+                  WHERE src.layer IN ['odata', 'pdata']
+                  RETURN src.name AS source_dataset, length(path) AS hops
+                  LIMIT 1
+                }
+                RETURN d.name AS dataset, source_dataset, hops
+                ORDER BY dataset
+                """
+            )
+        )
+        task_paths = records_to_plain(
+            session.run(
+                """
+                MATCH (:Project)-[:HAS_ENTRY_TASK]->(t:ScheduleTask)
+                WITH t LIMIT 20
+                CALL (t) {
+                  MATCH path = (t)-[:DEPENDS_ON*1..20]->(src:ScheduleTask)
+                  WHERE NOT (src)-[:DEPENDS_ON]->(:ScheduleTask)
+                  RETURN src.task_id AS terminal_task_id, length(path) AS hops
+                  LIMIT 1
+                }
+                RETURN t.task_id AS task_id, terminal_task_id, hops
+                ORDER BY task_id
+                """
+            )
+        )
+        metric_check = session.run(
+            """
+            MATCH (m:Metric)
+            WITH collect(m)[0..20] AS metrics
+            UNWIND metrics AS m
+            OPTIONAL MATCH (m)-[:STORED_IN]->(:Dataset)
+            WITH m, count(*) AS stored
+            OPTIONAL MATCH (m)-[:COMPUTED_BY]->(:ScheduleTask)
+            WITH m, stored, count(*) AS computed
+            RETURN count(m) AS sample_metric_count,
+                   sum(CASE WHEN stored > 0 THEN 1 ELSE 0 END) AS metrics_with_storage,
+                   sum(CASE WHEN computed > 0 THEN 1 ELSE 0 END) AS metrics_with_compute_task
+            """
+        ).single()
+        sample_column_lineage = records_to_plain(
+            session.run(
+                """
+                MATCH path = (c:Column)-[:DERIVED_FROM*1..3]->(src:Column)
+                RETURN c.dataset AS target_dataset, c.name AS target_column,
+                       src.dataset AS source_dataset, src.name AS source_column,
+                       length(path) AS hops
+                LIMIT 10
+                """
+            )
+        )
+    driver.close()
+    return {
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "label_distribution": label_dist,
+        "relationship_distribution": rel_dist,
+        "missing_edge_endpoint_count": missing_endpoints,
+        "dataset_trace_sample": dataset_paths,
+        "task_trace_sample": task_paths,
+        "metric_check": dict(metric_check),
+        "column_lineage_sample_count": len(sample_column_lineage),
+        "schema_index_count": schema_count,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("project_dir")
+    parser.add_argument("--prefix", default="strategy")
+    parser.add_argument("--uri", default="bolt://localhost:7687")
+    parser.add_argument("--user", default="neo4j")
+    parser.add_argument("--password-file", default=os.environ.get("NEO4J_PASSWORD_FILE"))
+    parser.add_argument("--batch-size", type=int, default=2000)
+    parser.add_argument("--skip-import", action="store_true")
+    args = parser.parse_args()
+
+    project_dir = Path(args.project_dir)
+    if not args.password_file:
+        raise SystemExit("--password-file or NEO4J_PASSWORD_FILE is required")
+    password = Path(args.password_file).read_text().strip()
+    import_summary = {}
+    if not args.skip_import:
+        import_summary = import_graph(project_dir, args.prefix, args.uri, args.user, password, args.batch_size)
+    else:
+        import_summary = {"skipped": True}
+    validation = validate(args.uri, args.user, password)
+    out = project_dir / f"{args.prefix}_neo4j_validation.json"
+    result = {"import": import_summary, "validation": validation}
+    out.write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps({"output": str(out), **import_summary, **validation}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
