@@ -169,3 +169,6 @@ python3 kg_probe/import_and_validate_neo4j.py \
 
 更完整的图模型见[GRAPH_MODEL.md](GRAPH_MODEL.md)，流水线说明见[PROJECT_PIPELINE.md](PROJECT_PIPELINE.md)。
 
+总体技术方案见[TECHNICAL_SOLUTION.md](TECHNICAL_SOLUTION.md)，增量更新操作见[INCREMENTAL_UPDATE.md](INCREMENTAL_UPDATE.md)。
+
+查询层统一协议和12个查询原语见[QUERY_LAYER_DESIGN.md](QUERY_LAYER_DESIGN.md)。

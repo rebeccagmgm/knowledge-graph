@@ -60,10 +60,10 @@ def main() -> None:
     logs_path = project_dir / "log_artifacts_full.json"
     errors_path = project_dir / "log_collection_errors.json"
 
-    existing_logs = load_existing(logs_path)
+    existing_logs = [] if args.force else load_existing(logs_path)
     existing_by_task = {item["task_id"]: item for item in existing_logs}
-    instance_facts = load_existing(instances_path)
-    errors = load_existing(errors_path)
+    instance_facts = [] if args.force else load_existing(instances_path)
+    errors = [] if args.force else load_existing(errors_path)
 
     api = init_api()
     collected = 0

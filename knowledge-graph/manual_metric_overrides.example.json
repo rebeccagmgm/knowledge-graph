@@ -1,0 +1,10 @@
+[
+  {
+    "metric_id": "ind_example",
+    "manual_definition": "人工确认的指标口径",
+    "remark": "代码证据不足，人工补充",
+    "updated_by": "user_id",
+    "updated_at": "2026-06-30T00:00:00+08:00",
+    "needs_review": false
+  }
+]
