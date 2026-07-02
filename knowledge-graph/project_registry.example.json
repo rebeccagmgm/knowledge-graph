@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "projects": [
+    {
+      "project_id": "example_project",
+      "enabled": true,
+      "scan_interval_hours": 48,
+      "result_task_ids": ["236334", "212769"],
+      "supplemental_task_ids": [],
+      "options": {
+        "max_depth": 25,
+        "max_nodes": 3000,
+        "build_llm": false,
+        "import_neo4j": false
+      }
+    }
+  ]
+}

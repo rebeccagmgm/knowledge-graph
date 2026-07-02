@@ -58,6 +58,7 @@ def main() -> None:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--backoff", type=float, default=0.5)
     parser.add_argument("--output-root", default=os.environ.get("KG_LINEAGE_ROOT", "artifacts/lineage_batch"))
+    parser.add_argument("--force", action="store_true", help="Refresh lineage even when a snapshot exists")
     args = parser.parse_args()
 
     api = init_api()
@@ -65,7 +66,7 @@ def main() -> None:
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_path = output_root / "lineage_batch_manifest.json"
-    if manifest_path.exists():
+    if manifest_path.exists() and not args.force:
         existing = json.loads(manifest_path.read_text())
         summaries = existing.get("summaries", [])
     else:
@@ -73,7 +74,7 @@ def main() -> None:
     done = {item.get("task_id") for item in summaries if item.get("path")}
     for task_id in tasks:
         path = output_root / f"{task_id}_lineage.json"
-        if task_id not in done and path.exists():
+        if not args.force and task_id not in done and path.exists():
             graph = json.loads(path.read_text())
             summaries.append({"task_id": task_id, "path": str(path), **graph.get("summary", {})})
             done.add(task_id)
