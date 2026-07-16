@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -54,7 +53,7 @@ def main() -> None:
     parser.add_argument("--detail-limit", type=int, default=0)
     parser.add_argument("--instance-limit", type=int, default=30)
     parser.add_argument("--log-scope", choices=["none", "root", "all"], default="root")
-    parser.add_argument("--output-root", default=os.environ.get("KG_OUTPUT_ROOT", "artifacts/projects"))
+    parser.add_argument("--output-root", default="/Applications/personal-work/kg-code-snapshots/projects")
     args = parser.parse_args()
 
     tasks = parse_tasks(args.tasks, args.task_file)

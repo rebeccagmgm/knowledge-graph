@@ -21,15 +21,15 @@ from pathlib import Path
 
 
 HORAE_APP = Path("/Users/yuanchunzhang/Downloads/horae-api")
-HORAE_ENV = Path(os.environ.get("HORAE_ENV_FILE", ".env"))
-DEFAULT_OUTPUT_ROOT = Path(os.environ.get("KG_OUTPUT_ROOT", "artifacts/projects"))
+HORAE_ENV = Path("/Applications/personal-work/horae_cookie.env")
+DEFAULT_OUTPUT_ROOT = Path("/Applications/personal-work/kg-code-snapshots/projects")
 
 
 def load_horae_cookie() -> None:
     if os.environ.get("HORAE_COOKIE"):
         return
     if not HORAE_ENV.exists():
-        raise SystemExit(f"Missing Horae env file: {HORAE_ENV}")
+        return
 
     text = HORAE_ENV.read_text(errors="ignore").strip()
     for line in text.splitlines():
@@ -53,7 +53,9 @@ def load_horae_cookie() -> None:
                 pass
         os.environ["HORAE_COOKIE"] = value.replace("\\;", ";").replace("\\ ", " ")
         return
-    raise SystemExit(f"HORAE_COOKIE not found in {HORAE_ENV}")
+    # The installed Horae client may already have a persisted authenticated session.
+    # In that case HoraeAPI.auth() below performs the normal client-side lookup.
+    return
 
 
 def init_api():
@@ -103,7 +105,14 @@ def fetch_direct_upstream(
             resp = api.get_downstream_list(task_id, is_downstream=0, hierarchy=1)
             if resp.status_code != 200:
                 raise RuntimeError(f"Horae relation HTTP {resp.status_code} for {task_id}")
-            data = json.loads(resp.text)
+            try:
+                data = json.loads(resp.text)
+            except json.JSONDecodeError as exc:
+                preview = re.sub(r"\s+", " ", resp.text[:240]).strip()
+                raise RuntimeError(
+                    f"Horae relation returned non-JSON for {task_id}; "
+                    f"content_type={resp.headers.get('Content-Type', '')!r}; preview={preview!r}"
+                ) from exc
             if not data.get("result"):
                 raise RuntimeError(f"Horae relation failed for {task_id}: {data.get('message')}")
             return [normalize_task(item) for item in data.get("data", []) if item.get("task_id")]

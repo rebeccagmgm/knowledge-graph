@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
@@ -70,8 +69,8 @@ def main() -> None:
     parser.add_argument("--project-id", default="trial_project")
     parser.add_argument("--tasks", default=None)
     parser.add_argument("--task-file", default=None)
-    parser.add_argument("--lineage-root", default=os.environ.get("KG_LINEAGE_ROOT", "artifacts/lineage_batch"))
-    parser.add_argument("--output-root", default=os.environ.get("KG_OUTPUT_ROOT", "artifacts/projects"))
+    parser.add_argument("--lineage-root", default="/Applications/personal-work/kg-code-snapshots/lineage_batch")
+    parser.add_argument("--output-root", default="/Applications/personal-work/kg-code-snapshots/projects")
     args = parser.parse_args()
 
     root_ids = parse_tasks(args.tasks, args.task_file)

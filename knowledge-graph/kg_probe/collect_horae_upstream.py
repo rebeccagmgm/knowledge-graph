@@ -18,14 +18,14 @@ from pathlib import Path
 
 
 HORAE_APP = Path("/Users/yuanchunzhang/Downloads/horae-api")
-HORAE_ENV = Path(os.environ.get("HORAE_ENV_FILE", ".env"))
+HORAE_ENV = Path("/Applications/personal-work/horae_cookie.env")
 
 
 def load_horae_cookie() -> None:
     if os.environ.get("HORAE_COOKIE"):
         return
     if not HORAE_ENV.exists():
-        raise SystemExit(f"Missing Horae env file: {HORAE_ENV}")
+        return
 
     text = HORAE_ENV.read_text(errors="ignore").strip()
     for line in text.splitlines():
@@ -50,7 +50,8 @@ def load_horae_cookie() -> None:
         value = value.replace("\\;", ";").replace("\\ ", " ")
         os.environ["HORAE_COOKIE"] = value
         return
-    raise SystemExit(f"HORAE_COOKIE not found in {HORAE_ENV}")
+    # Allow the installed Horae client to reuse its persisted authenticated session.
+    return
 
 
 def layer_of(task_name: str) -> str:
@@ -90,7 +91,14 @@ def fetch_direct_upstream(
             resp = api.get_downstream_list(task_id, is_downstream=0, hierarchy=1)
             if resp.status_code != 200:
                 raise RuntimeError(f"Horae relation HTTP {resp.status_code} for {task_id}")
-            data = json.loads(resp.text)
+            try:
+                data = json.loads(resp.text)
+            except json.JSONDecodeError as exc:
+                preview = re.sub(r"\s+", " ", resp.text[:240]).strip()
+                raise RuntimeError(
+                    f"Horae relation returned non-JSON for {task_id}; "
+                    f"content_type={resp.headers.get('Content-Type', '')!r}; preview={preview!r}"
+                ) from exc
             if not data.get("result"):
                 raise RuntimeError(f"Horae relation failed for {task_id}: {data.get('message')}")
             return [normalize_task(item) for item in data.get("data", []) if item.get("task_id")]
@@ -222,7 +230,7 @@ def main() -> None:
     parser.add_argument("--backoff", type=float, default=0.5)
     parser.add_argument(
         "--output-dir",
-        default=os.environ.get("KG_LINEAGE_OUTPUT", "artifacts/lineage"),
+        default="/Applications/personal-work/kg-code-snapshots/lineage",
     )
     args = parser.parse_args()
 

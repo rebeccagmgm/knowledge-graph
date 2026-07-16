@@ -5,16 +5,16 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import html
 import io
 import json
-import os
 import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 
-LOCAL_DEPS = Path(os.environ.get("KG_LOCAL_PYDEPS", "vendor"))
+LOCAL_DEPS = Path("/Applications/personal-work/kg-local-pydeps")
 if LOCAL_DEPS.exists():
     sys.path.insert(0, str(LOCAL_DEPS))
 
@@ -27,11 +27,17 @@ def norm_dataset(value: str) -> str:
 
 
 def norm_column(value: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_]+", "_", (value or "").strip()).strip("_").lower()
+    value = html.unescape(value or "")
+    value = re.sub(r"<[^>]+>", "", value)
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip()).strip("_").lower()
 
 
 def column_id(dataset: str, column: str) -> str:
     return f"column:{norm_dataset(dataset)}.{norm_column(column)}"
+
+
+def is_dataset_name(value: str) -> bool:
+    return bool(value and "." in value and not value.strip().startswith("${"))
 
 
 def table_name(table: exp.Table) -> str:
@@ -46,10 +52,33 @@ def table_name(table: exp.Table) -> str:
     return ".".join(part for part in parts if part)
 
 
+def best_dataset_match(dataset: str, columns_by_dataset: dict[str, list[str]]) -> str:
+    dataset = norm_dataset(dataset)
+    if dataset in columns_by_dataset:
+        return dataset
+    if not dataset:
+        return ""
+    suffix = f".{dataset.split('.')[-1]}"
+    matches = [name for name, columns in columns_by_dataset.items() if columns and name.endswith(suffix)]
+    if len(matches) == 1:
+        return matches[0]
+    return dataset
+
+
 def load(path: Path, default):
     if not path.exists():
         return default
     return json.loads(path.read_text())
+
+
+def resolve_statement_path(project_dir: Path, statement_path: str, statement_id: str) -> Path:
+    path = Path(statement_path)
+    if path.exists():
+        return path
+    local_path = project_dir / "sql" / f"{statement_id}.sql"
+    if local_path.exists():
+        return local_path
+    return path
 
 
 NOISE_LINE_RE = re.compile(
@@ -57,7 +86,10 @@ NOISE_LINE_RE = re.compile(
     r"hive session id|time taken|ok$|slf4j|warning:|spark context|"
     r"starting job|ended job|tracking url|kill command|executequery\b|"
     r"executing with spark engine|kerberos tgt|stage-\d+|map\s+\d+%|"
-    r"reduce\s+\d+%|spark\.sql\.|hive\.)",
+    r"reduce\s+\d+%|spark\.sql\.|hive\.|total jobs|launching job|"
+    r"ended job|counters:|mapreduce jobs launched|hdfs read|hdfs write|"
+    r"records read|records written|bytes read|bytes written|"
+    r"^\s*(?:finished|running|pending|failed)\s+\d+\s+\d+)",
     re.IGNORECASE,
 )
 SQL_LINE_RE = re.compile(
@@ -80,6 +112,26 @@ def normalize_sql_for_parse(sql: str) -> str:
             continue
         lines.append(raw_line)
     return "\n".join(lines).strip()
+
+
+def ctas_select_sql(sql: str) -> str:
+    match = re.search(r"\bAS\s+(SELECT|WITH)\b", sql, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return sql[match.start(1) :].strip().rstrip(";")
+
+
+def parse_sql(sql: str, dialect: str) -> exp.Expression | None:
+    with contextlib.redirect_stderr(io.StringIO()):
+        parsed = sqlglot.parse_one(sql, read=dialect, error_level="ignore")
+    if parsed is not None and list(select_queries(parsed)):
+        return parsed
+    fallback = ctas_select_sql(sql)
+    if not fallback:
+        return parsed
+    with contextlib.redirect_stderr(io.StringIO()):
+        fallback_parsed = sqlglot.parse_one(fallback, read=dialect, error_level="ignore")
+    return fallback_parsed or parsed
 
 
 def graph_task_outputs(project_dir: Path, prefix: str) -> dict[str, set[str]]:
@@ -126,6 +178,22 @@ def dms_column_index(project_dir: Path) -> dict[str, list[str]]:
     return index
 
 
+def hive_to_external_io(detail: dict) -> tuple[str, str]:
+    task_type = detail.get("task_type", "")
+    if not str(task_type).startswith("hive2"):
+        return "", ""
+    sync_info = detail.get("sync_info") or {}
+    target = norm_dataset((sync_info.get("目标库表") or "").strip())
+    hive_db = (sync_info.get("Hive源库") or "").strip()
+    hive_table = (sync_info.get("Hive源表") or "").strip()
+    source = norm_dataset(f"{hive_db}.{hive_table}") if hive_db and hive_table else ""
+    if not is_dataset_name(target):
+        target = ""
+    if not is_dataset_name(source):
+        source = ""
+    return source, target
+
+
 def table_aliases(parsed: exp.Expression) -> dict[str, str]:
     aliases = {}
     cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(exp.CTE)}
@@ -137,6 +205,21 @@ def table_aliases(parsed: exp.Expression) -> dict[str, str]:
         if alias:
             aliases[alias.lower()] = name
         aliases[name.split(".")[-1]] = name
+    for subquery in parsed.find_all(exp.Subquery):
+        alias = subquery.alias_or_name
+        if not alias:
+            continue
+        inner_tables = [
+            table_name(table)
+            for table in subquery.find_all(exp.Table)
+            if table_name(table).split(".")[-1] not in cte_names
+        ]
+        unique_tables = []
+        for name in inner_tables:
+            if name not in unique_tables:
+                unique_tables.append(name)
+        if len(unique_tables) == 1:
+            aliases[alias.lower()] = unique_tables[0]
     return aliases
 
 
@@ -144,12 +227,23 @@ def cte_names(parsed: exp.Expression) -> set[str]:
     return {cte.alias_or_name.lower() for cte in parsed.find_all(exp.CTE)}
 
 
-def select_expressions(parsed: exp.Expression) -> list[exp.Expression]:
-    selects = list(parsed.find_all(exp.Select))
-    if not selects:
+def select_queries(parsed: exp.Expression):
+    if parsed is None:
         return []
-    # The outermost SELECT is generally the statement output shape.
-    return list(selects[0].expressions)
+    if isinstance(parsed, exp.Create):
+        return select_queries(parsed.args.get("expression"))
+    if isinstance(parsed, exp.Subquery):
+        return select_queries(parsed.this)
+    if isinstance(parsed, exp.Union):
+        return select_queries(parsed.this) + select_queries(parsed.expression)
+    if isinstance(parsed, exp.Select):
+        return [parsed]
+    selects = list(parsed.find_all(exp.Select))
+    return selects[:1]
+
+
+def select_expression_groups(parsed: exp.Expression) -> list[list[exp.Expression]]:
+    return [list(select.expressions) for select in select_queries(parsed) if select.expressions]
 
 
 def output_name(expr: exp.Expression) -> str:
@@ -161,6 +255,20 @@ def output_name(expr: exp.Expression) -> str:
     return ""
 
 
+def expression_kind(expr: exp.Expression) -> str:
+    if isinstance(expr, exp.Alias):
+        return expression_kind(expr.this)
+    if isinstance(expr, exp.Literal):
+        return "literal"
+    if isinstance(expr, exp.Null):
+        return "literal"
+    if isinstance(expr, (exp.CurrentDate, exp.CurrentTimestamp)):
+        return "system_expression"
+    if list(expr.find_all(exp.Column)):
+        return "source_expression"
+    return "generated_expression"
+
+
 def resolve_direct_column(
     col_name: str,
     table: str,
@@ -169,6 +277,8 @@ def resolve_direct_column(
     columns_by_dataset: dict[str, list[str]],
 ) -> dict:
     dataset = aliases.get(table, "")
+    if dataset:
+        dataset = best_dataset_match(dataset, columns_by_dataset)
     confidence = "table_alias"
     if not dataset and len(read_datasets) == 1:
         dataset = next(iter(read_datasets))
@@ -254,7 +364,7 @@ def star_sources(
             return expanded
         dataset = aliases.get(table, "")
         if dataset:
-            datasets = [dataset]
+            datasets = [best_dataset_match(dataset, columns_by_dataset)]
     else:
         for alias, dataset in aliases.items():
             if "." in dataset and dataset not in datasets:
@@ -284,7 +394,7 @@ def projection_facts(
     read_datasets: set[str],
     columns_by_dataset: dict[str, list[str]],
     cte_column_sources: dict[str, dict[str, list[dict]]] | None = None,
-) -> tuple[list[tuple[str, list[dict]]], str | None]:
+) -> tuple[list[tuple[str, list[dict]]], dict | None]:
     expanded = star_sources(projection, aliases, read_datasets, columns_by_dataset, cte_column_sources)
     if expanded:
         grouped: dict[str, list[dict]] = defaultdict(list)
@@ -294,10 +404,32 @@ def projection_facts(
 
     out_col = output_name(projection)
     if not out_col:
-        return [], "projection_without_output_name"
+        return [], {"error": "projection_without_output_name"}
     sources = source_columns(projection, aliases, read_datasets, columns_by_dataset, cte_column_sources)
     if not sources:
-        return [], "projection_without_source_column"
+        kind = expression_kind(projection)
+        expression_sql = projection.sql()[:1000]
+        if kind in {"literal", "system_expression", "generated_expression"}:
+            return [
+                (
+                    out_col,
+                    [
+                        {
+                            "dataset": "",
+                            "column": "",
+                            "column_id": "",
+                            "confidence": kind,
+                            "generation_type": kind,
+                            "expression_sql": expression_sql,
+                        }
+                    ],
+                )
+            ], None
+        return [], {
+            "error": "projection_without_resolved_source_column",
+            "generation_type": kind,
+            "expression_sql": expression_sql,
+        }
     return [(out_col, sources)], None
 
 
@@ -325,8 +457,58 @@ def build_cte_column_sources(
     return result
 
 
+def create_table_name(sql: str) -> str:
+    match = re.search(
+        r"\bCREATE\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    return norm_dataset(match.group(1)) if match else ""
+
+
+def infer_projection_output_columns(parsed: exp.Expression) -> list[str]:
+    groups = select_expression_groups(parsed)
+    if not groups:
+        return []
+    columns = []
+    for projection in groups[0]:
+        if isinstance(projection, exp.Star) or (
+            isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
+        ):
+            continue
+        name = output_name(projection)
+        if name and name not in columns:
+            columns.append(name)
+    return columns
+
+
+def infer_ctas_columns(project_dir: Path, statements: list[dict], dialect: str) -> dict[str, list[str]]:
+    inferred: dict[str, list[str]] = {}
+    for stmt in statements:
+        statement_id = stmt.get("statement_id", "")
+        statement_path = resolve_statement_path(project_dir, stmt.get("statement_path", ""), statement_id)
+        if not statement_path.exists():
+            continue
+        sql = normalize_sql_for_parse(statement_path.read_text(errors="ignore"))
+        target = create_table_name(sql)
+        if not target or target in inferred:
+            continue
+        try:
+            parsed = parse_sql(sql, dialect)
+        except Exception:
+            continue
+        if parsed is None:
+            continue
+        columns = infer_projection_output_columns(parsed)
+        if columns:
+            inferred[target] = columns
+    return inferred
+
+
 def extract_for_statement(
+    project_dir: Path,
     stmt: dict,
+    details_by_task: dict[str, dict],
     reads_by_stmt: dict[str, set[str]],
     writes_by_stmt: dict[str, set[str]],
     outputs_by_task: dict[str, set[str]],
@@ -335,12 +517,21 @@ def extract_for_statement(
 ) -> tuple[list[dict], list[dict]]:
     statement_id = stmt["statement_id"]
     task_id = stmt["task_id"]
-    statement_path = Path(stmt["statement_path"])
+    statement_path = resolve_statement_path(project_dir, stmt.get("statement_path", ""), statement_id)
     if not statement_path.exists():
         return [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_statement_file"}]
 
+    sql = normalize_sql_for_parse(statement_path.read_text(errors="ignore"))
     target_datasets = set(writes_by_stmt.get(statement_id, set()))
     target_source = "statement_write"
+    sync_source_dataset, sync_target_dataset = hive_to_external_io(details_by_task.get(task_id, {}))
+    if sync_target_dataset:
+        target_datasets = {sync_target_dataset}
+        target_source = "task_sync_target"
+    ctas_target = create_table_name(sql)
+    if ctas_target and not sync_target_dataset:
+        target_datasets = {ctas_target}
+        target_source = "ctas_target"
     if not target_datasets:
         produced = outputs_by_task.get(task_id, set())
         if len(produced) == 1:
@@ -358,64 +549,71 @@ def extract_for_statement(
         else:
             return [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_target_dataset"}]
 
-    sql = normalize_sql_for_parse(statement_path.read_text(errors="ignore"))
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            parsed = sqlglot.parse_one(sql, read=dialect, error_level="ignore")
+        parsed = parse_sql(sql, dialect)
     except Exception as exc:  # noqa: BLE001
         return [], [{"statement_id": statement_id, "task_id": task_id, "error": str(exc)}]
     if parsed is None:
         return [], [{"statement_id": statement_id, "task_id": task_id, "error": "empty_parse"}]
 
-    projections = select_expressions(parsed)
-    if not projections:
+    projection_groups = select_expression_groups(parsed)
+    if not projection_groups:
         return [], [{"statement_id": statement_id, "task_id": task_id, "error": "no_select_projection"}]
 
     aliases = table_aliases(parsed)
-    read_datasets = reads_by_stmt.get(statement_id, set())
+    read_datasets = set(reads_by_stmt.get(statement_id, set()))
+    if sync_source_dataset:
+        read_datasets.add(sync_source_dataset)
     cte_column_sources = build_cte_column_sources(parsed, read_datasets, columns_by_dataset)
     facts = []
     errors = []
     for target_dataset in sorted(target_datasets):
-        for ordinal, projection in enumerate(projections, start=1):
-            projected_items, projection_error = projection_facts(
-                projection,
-                aliases,
-                read_datasets,
-                columns_by_dataset,
-                cte_column_sources,
-            )
-            if projection_error:
-                errors.append(
-                    {
-                        "statement_id": statement_id,
-                        "task_id": task_id,
-                        "error": projection_error,
-                        "target_dataset": target_dataset,
-                        "projection_ordinal": ordinal,
-                    }
+        for branch_ordinal, projections in enumerate(projection_groups, start=1):
+            for ordinal, projection in enumerate(projections, start=1):
+                projected_items, projection_error = projection_facts(
+                    projection,
+                    aliases,
+                    read_datasets,
+                    columns_by_dataset,
+                    cte_column_sources,
                 )
-                continue
-            for out_col, sources in projected_items:
-                for source in sources:
-                    facts.append(
+                if projection_error:
+                    errors.append(
                         {
                             "statement_id": statement_id,
                             "task_id": task_id,
+                            "error": projection_error["error"],
                             "target_dataset": target_dataset,
-                            "target_column": out_col,
-                            "target_column_id": column_id(target_dataset, out_col),
-                            "source_dataset": source["dataset"],
-                            "source_column": source["column"],
-                            "source_column_id": source["column_id"],
-                            "source_resolution": source["confidence"],
-                            "target_resolution": target_source,
                             "projection_ordinal": ordinal,
-                            "expression_sql": projection.sql(dialect=dialect)[:1000],
-                            "source_system": "sqlglot",
-                            "source_type": "column_lineage",
+                            "branch_ordinal": branch_ordinal,
+                            "generation_type": projection_error.get("generation_type"),
+                            "expression_sql": projection_error.get("expression_sql"),
                         }
                     )
+                    continue
+                for out_col, sources in projected_items:
+                    for source in sources:
+                        generation_type = source.get("generation_type")
+                        facts.append(
+                            {
+                                "statement_id": statement_id,
+                                "task_id": task_id,
+                                "target_dataset": target_dataset,
+                                "target_column": out_col,
+                                "target_column_id": column_id(target_dataset, out_col),
+                                "source_dataset": source["dataset"],
+                                "source_column": source["column"],
+                                "source_column_id": source["column_id"],
+                                "source_resolution": source["confidence"],
+                                "target_resolution": target_source,
+                                "projection_ordinal": ordinal,
+                                "branch_ordinal": branch_ordinal,
+                                "expression_sql": source.get("expression_sql") or projection.sql(dialect=dialect)[:1000],
+                                "generation_type": generation_type,
+                                "source_system": "sqlglot",
+                                "source_type": "generated_column" if generation_type else "column_lineage",
+                            }
+                        )
     return facts, errors
 
 
@@ -429,17 +627,25 @@ def main() -> None:
 
     project_dir = Path(args.project_dir)
     statements = load(project_dir / f"{args.prefix}_sql_statements.json", [])
+    details = load(project_dir / "task_details.json", [])
     if args.limit:
         statements = statements[: args.limit]
     reads_by_stmt, writes_by_stmt = statement_dataset_edges(project_dir, args.prefix)
     outputs_by_task = graph_task_outputs(project_dir, args.prefix)
     columns_by_dataset = dms_column_index(project_dir)
+    inferred_columns = infer_ctas_columns(project_dir, statements, args.dialect)
+    for dataset, columns in inferred_columns.items():
+        if dataset not in columns_by_dataset:
+            columns_by_dataset[dataset] = columns
+    details_by_task = {str(item.get("task_id")): item for item in details}
 
     all_facts = []
     all_errors = []
     for stmt in statements:
         facts, errors = extract_for_statement(
+            project_dir,
             stmt,
+            details_by_task,
             reads_by_stmt,
             writes_by_stmt,
             outputs_by_task,
@@ -456,11 +662,17 @@ def main() -> None:
     summary = {
         "statement_count": len(statements),
         "column_lineage_count": len(all_facts),
+        "derived_column_lineage_count": sum(1 for item in all_facts if item.get("source_dataset")),
+        "generated_column_count": sum(1 for item in all_facts if item.get("generation_type")),
         "error_count": len(all_errors),
         "target_dataset_count": len({item["target_dataset"] for item in all_facts}),
         "source_dataset_count": len({item["source_dataset"] for item in all_facts if item["source_dataset"]}),
         "source_resolution_distribution": dict(Counter(item["source_resolution"] for item in all_facts)),
+        "generation_type_distribution": dict(
+            Counter(item.get("generation_type", "") for item in all_facts if item.get("generation_type"))
+        ),
         "target_resolution_distribution": dict(Counter(item["target_resolution"] for item in all_facts)),
+        "inferred_ctas_schema_count": len(inferred_columns),
         "facts_path": str(facts_path),
         "errors_path": str(errors_path),
     }

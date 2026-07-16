@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 import time
@@ -13,7 +12,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-for LOCAL_USERBASE in [Path(os.environ.get("KG_PYTHON_USERBASE", "vendor"))]:
+for LOCAL_USERBASE in [
+    Path("/Applications/personal-work/kg-python-userbase/lib/python/site-packages"),
+    Path("/Applications/personal-work/kg-python-userbase/lib/python3.9/site-packages"),
+]:
     if LOCAL_USERBASE.exists():
         sys.path.insert(0, str(LOCAL_USERBASE))
 
@@ -251,14 +253,12 @@ def main() -> None:
     parser.add_argument("--prefix", default="strategy")
     parser.add_argument("--uri", default="bolt://localhost:7687")
     parser.add_argument("--user", default="neo4j")
-    parser.add_argument("--password-file", default=os.environ.get("NEO4J_PASSWORD_FILE"))
+    parser.add_argument("--password-file", default="/Applications/personal-work/kg-code-snapshots/neo4j_password.txt")
     parser.add_argument("--batch-size", type=int, default=2000)
     parser.add_argument("--skip-import", action="store_true")
     args = parser.parse_args()
 
     project_dir = Path(args.project_dir)
-    if not args.password_file:
-        raise SystemExit("--password-file or NEO4J_PASSWORD_FILE is required")
     password = Path(args.password_file).read_text().strip()
     import_summary = {}
     if not args.skip_import:

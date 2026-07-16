@@ -28,8 +28,8 @@ except ImportError:  # pragma: no cover - text normalization remains available
     sqlglot = None
 
 
-DEFAULT_OUTPUT_ROOT = Path(os.environ.get("KG_OUTPUT_ROOT", "artifacts/projects"))
-DEFAULT_LINEAGE_ROOT = Path(os.environ.get("KG_LINEAGE_ROOT", "artifacts/lineage_batch"))
+DEFAULT_OUTPUT_ROOT = Path("/Applications/personal-work/kg-code-snapshots/projects")
+DEFAULT_LINEAGE_ROOT = Path("/Applications/personal-work/kg-code-snapshots/lineage_batch")
 
 
 def now_iso() -> str:
@@ -575,7 +575,7 @@ def scan_project(config: dict, args) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--registry", default=os.environ.get("KG_PROJECT_REGISTRY", "project_registry.json"))
+    parser.add_argument("--registry", default="/Applications/personal-work/kg-code-snapshots/project_registry.json")
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--project-id")
     target.add_argument("--all", action="store_true", help="Scan every enabled project in the registry")

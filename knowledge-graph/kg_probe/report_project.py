@@ -140,11 +140,25 @@ def main() -> None:
             "resolved_source_fact_pct": pct(
                 sum(1 for item in column_lineage if item.get("source_dataset")), len(column_lineage)
             ),
+            "generated_column_fact_count": sum(1 for item in column_lineage if item.get("generation_type")),
+            "generated_column_fact_pct": pct(
+                sum(1 for item in column_lineage if item.get("generation_type")), len(column_lineage)
+            ),
+            "explainable_column_fact_count": sum(
+                1 for item in column_lineage if item.get("source_dataset") or item.get("generation_type")
+            ),
+            "explainable_column_fact_pct": pct(
+                sum(1 for item in column_lineage if item.get("source_dataset") or item.get("generation_type")),
+                len(column_lineage),
+            ),
             "target_dataset_count": len({item.get("target_dataset") for item in column_lineage if item.get("target_dataset")}),
             "source_dataset_count": len({item.get("source_dataset") for item in column_lineage if item.get("source_dataset")}),
             "error_count": len(column_lineage_errors),
             "source_resolution_distribution": dict(
                 Counter(item.get("source_resolution", "") for item in column_lineage)
+            ),
+            "generation_type_distribution": dict(
+                Counter(item.get("generation_type", "") for item in column_lineage if item.get("generation_type"))
             ),
             "target_resolution_distribution": dict(
                 Counter(item.get("target_resolution", "") for item in column_lineage)

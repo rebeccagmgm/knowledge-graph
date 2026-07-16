@@ -345,6 +345,8 @@ LLM不直接执行任意Cypher，而是将自然语言转换为受控查询计�
 
 详细协议、原语契约、限制和验收标准见[QUERY_LAYER_DESIGN.md](QUERY_LAYER_DESIGN.md)。
 
+当前已完成Python查询内核、CLI、统一JSON Schema和12个原语的真实Neo4j验证。REST、MCP和可视化界面尚未封装。
+
 ## 13. 安全与审计
 
 - Cookie、Token、API Key、Neo4j密码不得进入代码仓库。

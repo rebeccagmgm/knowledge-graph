@@ -98,6 +98,7 @@ def audit(project_dir: Path, prefix: str) -> dict:
             metric_compute[edge["from"]] += 1
 
     derived_edges = [edge for edge in edges if edge["type"] == "DERIVED_FROM"]
+    generated_edges = [edge for edge in edges if edge["type"] == "GENERATED_BY_EXPRESSION"]
     unresolved_derived = [
         edge["id"]
         for edge in derived_edges
@@ -126,6 +127,7 @@ def audit(project_dir: Path, prefix: str) -> dict:
         "metrics_without_storage_count": sum(1 for metric_id in metrics if metric_storage[metric_id] == 0),
         "metrics_without_compute_task_count": sum(1 for metric_id in metrics if metric_compute[metric_id] == 0),
         "derived_from_count": len(derived_edges),
+        "generated_by_expression_count": len(generated_edges),
         "low_confidence_derived_from_count": len(unresolved_derived),
         "low_confidence_derived_from_sample": unresolved_derived[:20],
     }

@@ -172,3 +172,5 @@ python3 kg_probe/import_and_validate_neo4j.py \
 总体技术方案见[TECHNICAL_SOLUTION.md](TECHNICAL_SOLUTION.md)，增量更新操作见[INCREMENTAL_UPDATE.md](INCREMENTAL_UPDATE.md)。
 
 查询层统一协议和12个查询原语见[QUERY_LAYER_DESIGN.md](QUERY_LAYER_DESIGN.md)。
+
+查询层CLI和Python调用示例见[QUERY_LAYER_USAGE.md](QUERY_LAYER_USAGE.md)。

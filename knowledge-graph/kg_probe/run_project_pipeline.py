@@ -12,8 +12,8 @@ import time
 from pathlib import Path
 
 
-DEFAULT_OUTPUT_ROOT = os.environ.get("KG_OUTPUT_ROOT", "artifacts/projects")
-DEFAULT_LINEAGE_ROOT = os.environ.get("KG_LINEAGE_ROOT", "artifacts/lineage_batch")
+DEFAULT_OUTPUT_ROOT = "/Applications/personal-work/kg-code-snapshots/projects"
+DEFAULT_LINEAGE_ROOT = "/Applications/personal-work/kg-code-snapshots/lineage_batch"
 
 
 def parse_tasks(value: str | None, task_file: str | None) -> list[str]:
@@ -38,9 +38,14 @@ def run_step(name: str, cmd: list[str], *, dry_run: bool = False) -> dict:
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return result
 
-    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
-    stdout_lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    stderr_lines = [line for line in proc.stderr.splitlines() if line.strip()]
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    proc = subprocess.run(cmd, capture_output=True, check=False, env=env)
+    stdout = decode_subprocess_output(proc.stdout)
+    stderr = decode_subprocess_output(proc.stderr)
+    stdout_lines = [line for line in stdout.splitlines() if line.strip()]
+    stderr_lines = [line for line in stderr.splitlines() if line.strip()]
     result = {
         "step": name,
         "returncode": proc.returncode,
@@ -52,6 +57,63 @@ def run_step(name: str, cmd: list[str], *, dry_run: bool = False) -> dict:
     if proc.returncode != 0:
         raise SystemExit(f"Step failed: {name}")
     return result
+
+
+def decode_subprocess_output(data: bytes | None) -> str:
+    if not data:
+        return ""
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def enforce_collection_quality(project_dir: Path, stage: str) -> None:
+    lineage = json.loads((project_dir / "lineage.json").read_text())
+    if stage == "lineage":
+        missing = lineage.get("missing_root_task_ids", [])
+        errors = lineage.get("errors", [])
+        if missing or errors:
+            raise SystemExit(
+                f"Collection quality gate failed after lineage: "
+                f"missing_roots={len(missing)}, errors={len(errors)}"
+            )
+        return
+    if stage == "details":
+        details = json.loads((project_dir / "task_details.json").read_text())
+        errors = json.loads((project_dir / "task_detail_errors.json").read_text())
+        expected = len(lineage.get("nodes", []))
+        if errors or len(details) != expected:
+            raise SystemExit(
+                f"Collection quality gate failed after details: "
+                f"expected={expected}, collected={len(details)}, errors={len(errors)}"
+            )
+        return
+    if stage == "page_code":
+        errors_path = project_dir / "code_artifacts_page_errors.json"
+        errors = json.loads(errors_path.read_text()) if errors_path.exists() else []
+        if errors:
+            raise SystemExit(f"Collection quality gate failed after page code: errors={len(errors)}")
+        return
+    if stage == "logs":
+        details = json.loads((project_dir / "task_details.json").read_text())
+        expected_ids = {
+            str(item["task_id"])
+            for item in details
+            if item.get("task_type") in {"hiveTask", "hiveTask-2.0"}
+        }
+        logs = json.loads((project_dir / "log_artifacts_full.json").read_text())
+        log_ids = {str(item["task_id"]) for item in logs}
+        errors_path = project_dir / "log_collection_errors.json"
+        errors = json.loads(errors_path.read_text()) if errors_path.exists() else []
+        if errors or expected_ids - log_ids:
+            raise SystemExit(
+                f"Collection quality gate failed after logs: "
+                f"expected={len(expected_ids)}, collected={len(log_ids)}, "
+                f"missing={len(expected_ids - log_ids)}, errors={len(errors)}"
+            )
 
 
 def add_flag(cmd: list[str], flag: str, enabled: bool) -> list[str]:
@@ -90,6 +152,7 @@ def main() -> None:
     parser.add_argument("--force-logs", action="store_true")
     parser.add_argument("--force-details", action="store_true")
     parser.add_argument("--force-lineage", action="store_true")
+    parser.add_argument("--allow-collection-errors", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -136,6 +199,8 @@ def main() -> None:
         args.output_root,
     ]
     steps.append(run_step("merge_lineage_project", merge_cmd, dry_run=args.dry_run))
+    if not args.dry_run and not args.allow_collection_errors:
+        enforce_collection_quality(project_dir, "lineage")
 
     details_cmd = [
         py,
@@ -150,6 +215,8 @@ def main() -> None:
     ]
     add_flag(details_cmd, "--force", args.force_details)
     steps.append(run_step("collect_details", details_cmd, dry_run=args.dry_run))
+    if not args.dry_run and not args.allow_collection_errors:
+        enforce_collection_quality(project_dir, "details")
 
     page_cmd = [
         py,
@@ -164,6 +231,8 @@ def main() -> None:
     ]
     add_flag(page_cmd, "--force", args.force_page_code)
     steps.append(run_step("collect_page_code", page_cmd, dry_run=args.dry_run))
+    if not args.dry_run and not args.allow_collection_errors:
+        enforce_collection_quality(project_dir, "page_code")
 
     if not args.skip_logs:
         logs_cmd = [
@@ -177,6 +246,8 @@ def main() -> None:
         ]
         add_flag(logs_cmd, "--force", args.force_logs)
         steps.append(run_step("collect_hive_logs", logs_cmd, dry_run=args.dry_run))
+        if not args.dry_run and not args.allow_collection_errors:
+            enforce_collection_quality(project_dir, "logs")
 
         steps.append(
             run_step(

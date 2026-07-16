@@ -13,14 +13,15 @@ from pathlib import Path
 
 
 SZ_APP = Path("/Users/yuanchunzhang/Downloads/szconnector")
-SZ_ENV = Path(os.environ.get("SZCONNECTOR_ENV_FILE", ".env"))
+SZ_ENV = Path("/Applications/personal-work/szconnector_cookie.env")
 
 
 def load_sz_env() -> None:
     if os.environ.get("SZCONNECTOR_COOKIE") and os.environ.get("SZCONNECTOR_TOKEN"):
         return
     if not SZ_ENV.exists():
-        raise SystemExit(f"Missing env file: {SZ_ENV}")
+        # ConfigManager/AuthManager can reuse the login created by `szconnector login`.
+        return
     for line in SZ_ENV.read_text(errors="ignore").splitlines():
         line = line.strip()
         if not line or "=" not in line:
@@ -286,12 +287,10 @@ def main() -> None:
         if args.sleep:
             time.sleep(args.sleep)
 
-    if dirty_dms:
-        write_json_atomic(dms_path, dms_results)
-    if dirty_ind:
-        write_json_atomic(indicator_path, indicator_results)
-    if dirty_errors:
-        write_json_atomic(errors_path, errors)
+    # Always materialize the three contract files, including empty result sets.
+    write_json_atomic(dms_path, dms_results)
+    write_json_atomic(indicator_path, indicator_results)
+    write_json_atomic(errors_path, errors)
 
     summary = {
         "dataset_count": len(datasets),
