@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Code Knowledge Graph Query Protocol",
+  "$defs": {
+    "commonRequest": {
+      "type": "object",
+      "properties": {
+        "project_id": {"type": "string"},
+        "max_hops": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+        "cursor": {"type": ["string", "null"]},
+        "include_evidence": {"type": "boolean", "default": true},
+        "include_properties": {"type": "boolean", "default": true},
+        "confidence_min": {"enum": ["low", "medium", "high"], "default": "medium"},
+        "mode": {"enum": ["strict", "balanced", "exploratory"], "default": "balanced"}
+      }
+    },
+    "subject": {
+      "type": "object",
+      "properties": {
+        "entity_id": {"type": "string"},
+        "entity_type": {"type": "string"},
+        "key": {"type": "string"}
+      }
+    },
+    "entity": {
+      "type": "object",
+      "required": ["entity_id", "entity_type", "key", "display_name", "properties"],
+      "properties": {
+        "entity_id": {"type": "string"},
+        "entity_type": {"type": "string"},
+        "key": {"type": "string"},
+        "display_name": {"type": "string"},
+        "properties": {"type": "object"}
+      }
+    },
+    "response": {
+      "type": "object",
+      "required": ["request_id", "primitive", "status", "answer", "data", "entities", "paths", "evidence", "warnings", "graph_context", "page", "diagnostics"],
+      "properties": {
+        "request_id": {"type": "string"},
+        "primitive": {"type": "string"},
+        "status": {"enum": ["ok", "partial", "ambiguous", "not_found", "error"]},
+        "answer": {"type": "string"},
+        "data": {"type": "object"},
+        "entities": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
+        "paths": {"type": "array"},
+        "evidence": {"type": "array"},
+        "warnings": {"type": "array"},
+        "graph_context": {"type": "object"},
+        "page": {"type": "object"},
+        "diagnostics": {"type": "object"}
+      }
+    }
+  },
+  "primitives": {
+    "search_entities": {"required": ["query"]},
+    "resolve_entity": {"requiredAny": ["entity_id", "query", "subject"]},
+    "get_metric_context": {"requiredAny": ["metric_id", "entity_id", "subject"]},
+    "get_task_context": {"requiredAny": ["task_id", "entity_id", "subject"]},
+    "get_dataset_context": {"requiredAny": ["dataset", "entity_id", "subject"]},
+    "get_column_context": {"requiredAny": ["column", "entity_id", "subject"]},
+    "trace_upstream": {"required": ["subject"]},
+    "trace_downstream": {"required": ["subject"]},
+    "analyze_impact": {"required": ["subject", "change_type"]},
+    "compare_metric_definitions": {"requiredAny": ["metric_id", "entity_id", "subject"]},
+    "find_definition_issues": {"required": ["issue_types"]},
+    "explain_lineage_path": {"required": ["from_entity_id", "to_entity_id"]}
+  }
+}

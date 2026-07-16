@@ -5,13 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 
-DEFAULT_OUTPUT_ROOT = os.environ.get("KG_OUTPUT_ROOT", "artifacts/projects")
+DEFAULT_OUTPUT_ROOT = "/Applications/personal-work/kg-code-snapshots/projects"
 
 
 def run_step(name: str, cmd: list[str]) -> dict:

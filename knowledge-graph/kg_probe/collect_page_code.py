@@ -51,6 +51,7 @@ def collect_for_task(
     retries: int = 3,
     backoff_sec: float = 0.5,
 ) -> tuple[list[dict], dict | None]:
+    from horae.commands.detail import is_valid_detail_html
     from horae.utils import extract_sql_from_extbase, extract_sync_sqls_from_extbase
 
     resp = None
@@ -73,6 +74,13 @@ def collect_for_task(
             time.sleep(backoff_sec * (2**attempt))
 
     html = resp.text
+    if not is_valid_detail_html(html, task_id):
+        return [], {
+            "task_id": task_id,
+            "error": "invalid detail html while collecting page code",
+            "status": "pending_retry",
+            "retry_count": retries,
+        }
     table_name = task_table_name(html, task_id)
     artifacts = []
 

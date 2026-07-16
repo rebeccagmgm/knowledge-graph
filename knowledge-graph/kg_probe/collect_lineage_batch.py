@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -57,7 +56,7 @@ def main() -> None:
     parser.add_argument("--sleep", type=float, default=0.03)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--backoff", type=float, default=0.5)
-    parser.add_argument("--output-root", default=os.environ.get("KG_LINEAGE_ROOT", "artifacts/lineage_batch"))
+    parser.add_argument("--output-root", default="/Applications/personal-work/kg-code-snapshots/lineage_batch")
     parser.add_argument("--force", action="store_true", help="Refresh lineage even when a snapshot exists")
     args = parser.parse_args()
 

@@ -33,6 +33,11 @@ def edge(edge_id: str, from_id: str, to_id: str, rel_type: str, **props) -> dict
     }
 
 
+def generated_expression_id(statement_id: str, projection_ordinal: int | str, expression_sql: str) -> str:
+    digest = hashlib.sha256((expression_sql or "").encode("utf-8")).hexdigest()[:16]
+    return f"generated_expression:{statement_id}:{projection_ordinal}:{digest}"
+
+
 def build_id_for(base: Path, prefix: str, lineage_project_key: str) -> str:
     raw = f"{lineage_project_key}|{prefix}|{datetime.now().isoformat(timespec='seconds')}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -55,6 +60,8 @@ def confidence_for_edge(edge_item: dict) -> str:
         if str(source_resolution).startswith("cte_"):
             return "medium"
         return "low"
+    if rel_type == "GENERATED_BY_EXPRESSION":
+        return "medium"
     if rel_type in {"PRODUCES", "CONSUMES", "COMPUTED_BY", "OWNS", "BELONGS_TO_LAYER", "EMITS_SQL"}:
         return "medium"
     return "unknown"
@@ -74,6 +81,8 @@ def fact_type_for_node(node_item: dict) -> str:
         return "metric_definition"
     if "SqlStatement" in labels:
         return "code_statement"
+    if "GeneratedExpression" in labels:
+        return "generated_expression"
     if "RuntimeLog" in labels:
         return "runtime_evidence"
     if "Owner" in labels:
@@ -91,7 +100,7 @@ def fact_type_for_edge(edge_item: dict) -> str:
         return "schedule_lineage"
     if rel_type in {"READS", "WRITES", "DATASET_DEPENDS_ON", "PRODUCES", "CONSUMES"}:
         return "table_lineage"
-    if rel_type in {"DERIVED_FROM", "HAS_COLUMN"}:
+    if rel_type in {"DERIVED_FROM", "HAS_COLUMN", "GENERATED_BY_EXPRESSION"}:
         return "column_lineage"
     if rel_type in {"STORED_IN", "COMPUTED_BY", "HAS_DEFINITION"}:
         return "metric_lineage"
@@ -243,8 +252,9 @@ def infer_task_datasets(task_node: dict, detail: dict) -> tuple[set[str], set[st
     task_name = (task_node.get("task_name") or detail.get("description") or "").strip()
     produces: set[str] = set()
     consumes: set[str] = set()
+    is_hive_to_external = task_type.startswith("hive2")
 
-    if is_dataset_name(task_name):
+    if is_dataset_name(task_name) and not is_hive_to_external:
         produces.add(task_name.lower())
 
     hive_db = (sync_info.get("Hive源库") or "").strip()
@@ -262,7 +272,7 @@ def infer_task_datasets(task_node: dict, detail: dict) -> tuple[set[str], set[st
             "hdfs2hive",
         }:
             produces.add(hive_dataset)
-        elif task_type.startswith("hive2"):
+        elif is_hive_to_external:
             consumes.add(hive_dataset)
 
     target = (sync_info.get("目标库表") or "").strip()
@@ -658,12 +668,53 @@ def main() -> None:
         target_dataset = (item.get("target_dataset") or "").lower()
         source_column = item.get("source_column") or ""
         target_column = item.get("target_column") or ""
+        generation_type = item.get("generation_type") or ""
+        expression_sql = item.get("expression_sql") or ""
+        if generation_type and target_dataset and target_column:
+            target_column_id = add_column_node(nodes, edges, target_dataset, target_column)
+            statement_raw_id = item.get("statement_id")
+            statement_id = f"sql:{statement_raw_id}"
+            expr_id = generated_expression_id(str(statement_raw_id), item.get("projection_ordinal"), expression_sql)
+            nodes[expr_id] = node(
+                expr_id,
+                ["GeneratedExpression"],
+                expression_id=expr_id,
+                generation_type=generation_type,
+                expression_sql=expression_sql,
+                statement_id=statement_id,
+                task_id=item.get("task_id"),
+                projection_ordinal=item.get("projection_ordinal"),
+                source_system=item.get("source_system"),
+                source_type=item.get("source_type"),
+            )
+            edge_id = (
+                f"{target_column_id}->GENERATED_BY_EXPRESSION->{expr_id}:"
+                f"{statement_raw_id}:{item.get('branch_ordinal')}:{item.get('projection_ordinal')}"
+            )
+            edges[edge_id] = edge(
+                edge_id,
+                target_column_id,
+                expr_id,
+                "GENERATED_BY_EXPRESSION",
+                statement_id=statement_id,
+                task_id=item.get("task_id"),
+                generation_type=generation_type,
+                target_resolution=item.get("target_resolution"),
+                branch_ordinal=item.get("branch_ordinal"),
+                projection_ordinal=item.get("projection_ordinal"),
+                source_system=item.get("source_system"),
+                source_type=item.get("source_type"),
+            )
+            continue
         if not source_dataset or not target_dataset or not source_column or not target_column:
             continue
         source_column_id = add_column_node(nodes, edges, source_dataset, source_column)
         target_column_id = add_column_node(nodes, edges, target_dataset, target_column)
         statement_id = f"sql:{item.get('statement_id')}"
-        edge_id = f"{target_column_id}->DERIVED_FROM->{source_column_id}:{item.get('statement_id')}:{item.get('projection_ordinal')}"
+        edge_id = (
+            f"{target_column_id}->DERIVED_FROM->{source_column_id}:"
+            f"{item.get('statement_id')}:{item.get('branch_ordinal')}:{item.get('projection_ordinal')}"
+        )
         edges[edge_id] = edge(
             edge_id,
             target_column_id,
@@ -673,6 +724,7 @@ def main() -> None:
             task_id=item.get("task_id"),
             source_resolution=item.get("source_resolution"),
             target_resolution=item.get("target_resolution"),
+            branch_ordinal=item.get("branch_ordinal"),
             projection_ordinal=item.get("projection_ordinal"),
             source_system=item.get("source_system"),
             source_type=item.get("source_type"),

@@ -7,14 +7,13 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import re
 import sys
 from collections import Counter
 from pathlib import Path
 
 
-LOCAL_DEPS = Path(os.environ.get("KG_LOCAL_PYDEPS", "vendor"))
+LOCAL_DEPS = Path("/Applications/personal-work/kg-local-pydeps")
 if LOCAL_DEPS.exists():
     sys.path.insert(0, str(LOCAL_DEPS))
 
