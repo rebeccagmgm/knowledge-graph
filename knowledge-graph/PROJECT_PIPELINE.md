@@ -1,67 +1,67 @@
-# 项目级流水线
+# Project Pipeline
 
-`run_project_pipeline.py`是多结果任务项目的统一入口。
+`run_project_pipeline.py` is the reusable entrypoint for a project with multiple result task IDs.
 
-## 基本用法
-
-直接传入任务ID：
+## Basic Usage
 
 ```bash
-python3 kg_probe/run_project_pipeline.py \
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
   --project-id my_project \
-  --tasks 236334,212769,207174
+  --tasks 236334,212769,207174 \
+  --import-neo4j
 ```
 
-任务文件支持逗号分隔或每行一个ID：
+Task file format can be comma-separated or one ID per line:
 
 ```bash
-python3 kg_probe/run_project_pipeline.py \
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
   --project-id my_project \
-  --task-file examples/task_ids.example.txt
+  --task-file /Applications/personal-work/my_project_tasks.txt \
+  --import-neo4j
 ```
 
-预演模式只输出将执行的命令，不访问内部服务：
+Dry run:
 
 ```bash
-python3 kg_probe/run_project_pipeline.py \
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
   --project-id my_project \
   --tasks 236334,212769,207174 \
   --dry-run
 ```
 
-启用LLM指标口径层：
+Optional LLM metric-definition layer:
 
 ```bash
-export LLM_API_KEY="..."
-export LLM_BASE_URL="https://api.deepseek.com"
-export LLM_MODEL="deepseek-v4-pro"
-
-python3 kg_probe/run_project_pipeline.py \
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
   --project-id my_project \
-  --task-file examples/task_ids.example.txt \
+  --task-file /Applications/personal-work/my_project_tasks.txt \
+  --build-llm
+```
+
+Real LLM calls use an OpenAI-compatible endpoint:
+
+```bash
+export OPENAI_API_KEY="..."
+export LLM_MODEL="gpt-4.1-mini"
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
+  --project-id my_project \
+  --task-file /Applications/personal-work/my_project_tasks.txt \
   --build-llm \
   --llm-provider openai-compatible
 ```
 
-默认LLM提供方为`mock`，用于在不调用真实模型的情况下验证证据、请求和构图链路。
+Set `LLM_BASE_URL` when using an internal OpenAI-compatible gateway. The default provider is `mock`, which validates the evidence/request/graph path without calling a model.
 
-## 输出目录
+## Output Layout
 
-建议配置：
-
-```bash
-export KG_LINEAGE_ROOT="$PWD/artifacts/lineage_batch"
-export KG_OUTPUT_ROOT="$PWD/artifacts/projects"
-```
-
-对于`--project-id my_project`，主要输出为：
+For `--project-id my_project`:
 
 ```text
-artifacts/lineage_batch/my_project
-artifacts/projects/my_project
+/Applications/personal-work/kg-code-snapshots/lineage_batch/my_project
+/Applications/personal-work/kg-code-snapshots/projects/my_project
 ```
 
-最终产物包括：
+Important final artifacts:
 
 - `lineage.json`
 - `task_details.json`
@@ -75,86 +75,99 @@ artifacts/projects/my_project
 - `strategy_neo4j_import.cypher`
 - `strategy_query_templates.cypher`
 - `strategy_graph_query_validation.json`
-- `strategy_neo4j_validation.json`，仅在使用`--import-neo4j`时生成
+- `strategy_neo4j_validation.json` if `--import-neo4j` is used
 - `strategy_quality_report.json`
-- `llm/evidence_bundles.jsonl`，仅在使用`--build-llm`时生成
-- `llm/code_definition_requests.jsonl`
-- `llm/code_definitions.jsonl`
-- `llm/definition_comparisons.jsonl`
-- `strategy_llm_graph_nodes.jsonl`
-- `strategy_llm_graph_edges.jsonl`
+- `llm/evidence_bundles.jsonl` if `--build-llm` is used
+- `llm/code_definition_requests.jsonl` if `--build-llm` is used
+- `llm/code_definitions.jsonl` if `--build-llm` is used
+- `llm/definition_comparisons.jsonl` if `--build-llm` is used
+- `strategy_llm_graph_nodes.jsonl` if `--build-llm` is used
+- `strategy_llm_graph_edges.jsonl` if `--build-llm` is used
 - `project_pipeline_manifest.json`
 
-## 执行顺序
+## Step Order
 
-1. 分别从每个结果任务递归采集上游血缘。
-2. 将多个入口的血缘快照合并为项目级调度图。
-3. 采集Horae任务详情。
-4. 采集任务页面SQL和配置。
-5. 仅为`hiveTask`、`hiveTask-2.0`采集运行日志。
-6. 解析Hive日志SQL。
-7. 解析任务页面SQL。
-8. 按任务类型选择权威SQL来源并合并事实。
-9. 构建初始图。
-10. 根据图中的表采集SzConnector元数据。
-11. 提取字段血缘。
-12. 重新构图。
-13. 为字段解析中新发现的表补采SzConnector元数据。
-14. 按配置重复字段血缘提取。
-15. 构建最终基础图。
-16. 审计图事实。
-17. 导出Neo4j Schema、导入Cypher和查询模板。
-18. 离线验证图查询。
-19. 可选构建LLM证据、代码口径、登记口径比较和增强图。
-20. 可选审计并验证LLM增强图。
-21. 可选导入Neo4j；启用LLM时导入`strategy_llm`。
-22. 生成最终质量报告。
+1. Collect upstream lineage for each result task.
+2. Merge all lineage snapshots into one project-level lineage graph.
+3. Collect Horae task details.
+4. Collect task-page SQL/config.
+5. Collect runtime logs only for `hiveTask,hiveTask-2.0`.
+6. Parse hive log SQL.
+7. Parse page SQL.
+8. Merge SQL facts by task-type strategy.
+9. Build initial graph.
+10. Collect SzConnector metadata from graph datasets.
+11. Extract column lineage.
+12. Rebuild graph.
+13. Re-collect SzConnector metadata for newly surfaced graph datasets.
+14. Repeat column-lineage pass if configured.
+15. Build final graph.
+16. Audit facts.
+17. Export Neo4j schema, import Cypher, and query templates.
+18. Run offline graph query validation.
+19. Optionally build LLM evidence, definitions, comparisons, and an enhanced graph.
+20. Optionally audit, export, and validate the LLM-enhanced graph.
+21. Optionally import and validate Neo4j. With `--build-llm`, the imported prefix is `strategy_llm`.
+22. Generate final quality report.
 
-## 断点续跑
+## Resume Behavior
 
-- 血缘批处理跳过已存在的入口任务快照。
-- `task_details.json`存在时复用任务详情，除非指定`--force-details`。
-- `code_artifacts_page.json`存在时复用页面代码，除非指定`--force-page-code`。
-- `log_artifacts_full.json`存在时复用Hive日志，除非指定`--force-logs`。
-- SzConnector跳过已存在于`dataset_dms.json`和`indicator_registry.json`的对象。
-- LLM脚本使用`--resume`时跳过状态为`ok`的结果，并重试失败项。
+The pipeline is designed for reruns:
 
-## 强制刷新参数
+- Lineage batch skips roots already present in the lineage batch directory.
+- Task details reuse `task_details.json` unless `--force-details` is set.
+- Page code reuse `code_artifacts_page.json` unless `--force-page-code` is set.
+- Hive logs reuse `log_artifacts_full.json` unless `--force-logs` is set.
+- SzConnector metadata skips datasets already present in `sz_metadata/dataset_dms.json` and `indicator_registry.json`.
 
-- `--force-details`：重新采集任务详情。
-- `--force-page-code`：重新采集任务页面SQL和配置。
-- `--force-logs`：重新采集Hive运行日志。
+## Force Flags
 
-大项目仅在确认数据过期时使用强制刷新参数。
+- `--force-details`: recollect task detail pages.
+- `--force-page-code`: recollect task page SQL/config artifacts.
+- `--force-logs`: recollect hive runtime logs.
 
-## LLM参数
+Avoid force flags for large projects unless necessary.
 
-- `--build-llm`：构建指标口径层。
-- `--llm-provider mock`：不调用模型，只验证本地流程。
-- `--llm-provider openai-compatible`：调用兼容`/chat/completions`的接口。
-- `--llm-model`：覆盖`LLM_MODEL`。
-- `--llm-output-prefix`：增强图前缀，默认为`strategy_llm`。
-- `--llm-max-sql-chars`：限制证据包中每条SQL的长度。
-- `--llm-sleep`：控制真实模型请求间隔。
+## LLM Flags
 
-真实模型调用会发送SQL、表元数据和指标登记信息，应先完成数据安全审批。
+- `--build-llm`: build the optional metric definition layer.
+- `--llm-provider mock`: validate locally without model calls.
+- `--llm-provider openai-compatible`: call `/chat/completions` using `OPENAI_API_KEY` or `LLM_API_KEY`.
+- `--llm-model`: override `LLM_MODEL`.
+- `--llm-output-prefix`: override the enhanced graph prefix. Default is `strategy_llm`.
+- `--llm-max-sql-chars`: cap SQL text per statement in evidence bundles.
+- `--llm-sleep`: throttle real model requests.
 
 ## Neo4j
 
-只有在Neo4j已启动且确实需要更新数据库时才使用`--import-neo4j`。
+Use `--import-neo4j` only when local Neo4j is running and you want the database updated.
 
-未导入Neo4j时，最终质量报告仍会生成。如果旧的Neo4j验证数量与当前JSONL图不一致，报告中会标记：
+Without `--import-neo4j`, the final quality report still runs. It will set:
 
 ```json
-{"has_stale_neo4j_validation": true}
+"has_stale_neo4j_validation": true
 ```
 
-## 当前工程假设
+when the previous Neo4j validation no longer matches the current graph JSONL counts.
 
-- `hiveTask`和`hiveTask-2.0`以运行日志SQL为准。
-- 非Hive任务以任务页面SQL或配置为准。
-- `sparkIndex`从任务页面`prepare.sqls`识别目标表。
-- Git设计态代码采集暂缓。
-- 数据服务节点暂缓。
-- 指标登记信息仅作比较依据，冲突时以代码和表元数据优先。
+## Known Project-Level Assumptions
 
+- Hive runtime SQL is authoritative for `hiveTask` and `hiveTask-2.0`.
+- Task-page SQL/config is authoritative for non-hive tasks.
+- `sparkIndex` target/write logic is read from task-page `prepare.sqls`.
+- Git repository collection is intentionally deferred.
+- Data-service nodes are intentionally deferred.
+
+## Incremental Update Integration
+
+`incremental_update.py` sits in front of this pipeline:
+
+1. Read project result and supplemental task IDs from the registry.
+2. Refresh upstream lineage, task details, page code, and Hive runtime SQL.
+3. Stop if the refresh quality gate reports missing or failed artifacts.
+4. Compare task metadata, dependency edges, raw code hashes, and normalized SQL semantic hashes.
+5. Return immediately when there is no semantic change.
+6. Compute affected downstream tasks and metrics when a change exists.
+7. Invoke this full project pipeline to rebuild and validate the project.
+
+The first incremental version deliberately rebuilds the project instead of patching Neo4j task by task. See `INCREMENTAL_UPDATE.md` for commands and operational files.

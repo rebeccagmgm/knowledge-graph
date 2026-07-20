@@ -5,8 +5,7 @@
 ## 图谱状态
 
 ```bash
-cd /path/to/kg_probe_gf
-export PYTHONPATH="$PWD/kg_probe"
+cd /Applications/personal-work/kg_probe
 python3 -m query_layer.cli get_graph_status --pretty
 ```
 
@@ -74,7 +73,7 @@ store = Neo4jStore.from_password_file(
     "neo4j",
     "/secure/neo4j_password.txt",
 )
-service = QueryService(store, "trial_project", "artifacts/projects/trial_project")
+service = QueryService(store, "trial_project", "/data/projects/trial_project")
 result = service.execute("search_entities", {"query": "打新次数", "entity_types": ["metric"]})
 store.close()
 ```

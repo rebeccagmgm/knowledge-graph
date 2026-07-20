@@ -100,7 +100,13 @@ SQL_LINE_RE = re.compile(
 
 def normalize_sql_for_parse(sql: str) -> str:
     sql = re.sub(r"\x1b\[[0-9;]*m", "", sql).replace("\r\n", "\n").replace("\r", "\n")
-    sql = re.sub(r"^\s*(?:CREATE\s+TABLE\s+statement|SQL\s+statement)\s*:\s*", "", sql, flags=re.IGNORECASE)
+    sql = sql.replace(r"\`", "`")
+    sql = re.sub(
+        r"^\s*(?:CREATE\s+TABLE\s+statement|INSERT\s+OVERWRITE\s+statement|SQL\s+statement)\s*:\s*",
+        "",
+        sql,
+        flags=re.IGNORECASE,
+    )
     lines = []
     for raw_line in sql.splitlines():
         line = raw_line.strip()
@@ -394,6 +400,7 @@ def projection_facts(
     read_datasets: set[str],
     columns_by_dataset: dict[str, list[str]],
     cte_column_sources: dict[str, dict[str, list[dict]]] | None = None,
+    fallback_output_name: str = "",
 ) -> tuple[list[tuple[str, list[dict]]], dict | None]:
     expanded = star_sources(projection, aliases, read_datasets, columns_by_dataset, cte_column_sources)
     if expanded:
@@ -402,7 +409,8 @@ def projection_facts(
             grouped[source.pop("output_column")].append(source)
         return sorted(grouped.items()), None
 
-    out_col = output_name(projection)
+    out_col = output_name(projection) or norm_column(fallback_output_name)
+    output_confidence = "target_schema_ordinal" if fallback_output_name and not output_name(projection) else ""
     if not out_col:
         return [], {"error": "projection_without_output_name"}
     sources = source_columns(projection, aliases, read_datasets, columns_by_dataset, cte_column_sources)
@@ -421,6 +429,7 @@ def projection_facts(
                             "confidence": kind,
                             "generation_type": kind,
                             "expression_sql": expression_sql,
+                            "output_resolution": output_confidence,
                         }
                     ],
                 )
@@ -430,6 +439,8 @@ def projection_facts(
             "generation_type": kind,
             "expression_sql": expression_sql,
         }
+    if output_confidence:
+        sources = [{**source, "output_resolution": output_confidence} for source in sources]
     return [(out_col, sources)], None
 
 
@@ -464,6 +475,33 @@ def create_table_name(sql: str) -> str:
         flags=re.IGNORECASE,
     )
     return norm_dataset(match.group(1)) if match else ""
+
+
+def is_non_lineage_statement(sql: str) -> tuple[bool, str]:
+    compact = sql.strip().rstrip(";")
+    if not compact:
+        return True, "empty_statement"
+    lowered = compact.lower()
+    if re.match(r"^(?:drop|truncate|alter|set|use|add\s+jar)\b", lowered):
+        return True, "non_lineage_statement"
+    if re.match(r"^create\s+(?:temporary\s+)?table\b", lowered) and not re.search(
+        r"\bas\s+(?:select|with)\b", lowered
+    ):
+        return True, "create_table_ddl"
+    return False, ""
+
+
+def write_table_name(parsed: exp.Expression | None, sql: str, columns_by_dataset: dict[str, list[str]]) -> str:
+    if isinstance(parsed, exp.Insert) and isinstance(parsed.this, exp.Table):
+        return best_dataset_match(table_name(parsed.this), columns_by_dataset)
+    match = re.search(
+        r"\bINSERT\s+(?:OVERWRITE|INTO)\s+TABLE\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return best_dataset_match(norm_dataset(match.group(1)), columns_by_dataset)
+    return ""
 
 
 def infer_projection_output_columns(parsed: exp.Expression) -> list[str]:
@@ -514,14 +552,17 @@ def extract_for_statement(
     outputs_by_task: dict[str, set[str]],
     columns_by_dataset: dict[str, set[str]],
     dialect: str,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict]]:
     statement_id = stmt["statement_id"]
     task_id = stmt["task_id"]
     statement_path = resolve_statement_path(project_dir, stmt.get("statement_path", ""), statement_id)
     if not statement_path.exists():
-        return [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_statement_file"}]
+        return [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_statement_file"}], []
 
     sql = normalize_sql_for_parse(statement_path.read_text(errors="ignore"))
+    should_skip, skip_reason = is_non_lineage_statement(sql)
+    if should_skip:
+        return [], [], [{"statement_id": statement_id, "task_id": task_id, "reason": skip_reason}]
     target_datasets = set(writes_by_stmt.get(statement_id, set()))
     target_source = "statement_write"
     sync_source_dataset, sync_target_dataset = hive_to_external_io(details_by_task.get(task_id, {}))
@@ -545,20 +586,31 @@ def extract_for_statement(
                     "error": "ambiguous_task_outputs",
                     "target_count": len(produced),
                 }
-            ]
+            ], []
         else:
-            return [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_target_dataset"}]
+            target = write_table_name(None, sql, columns_by_dataset)
+            if target:
+                target_datasets = {target}
+                target_source = "parsed_write_target"
+            else:
+                return [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_target_dataset"}], []
 
     try:
         parsed = parse_sql(sql, dialect)
     except Exception as exc:  # noqa: BLE001
-        return [], [{"statement_id": statement_id, "task_id": task_id, "error": str(exc)}]
+        return [], [{"statement_id": statement_id, "task_id": task_id, "error": str(exc)}], []
     if parsed is None:
-        return [], [{"statement_id": statement_id, "task_id": task_id, "error": "empty_parse"}]
+        return [], [{"statement_id": statement_id, "task_id": task_id, "error": "empty_parse"}], []
+
+    if not target_datasets:
+        target = write_table_name(parsed, sql, columns_by_dataset)
+        if target:
+            target_datasets = {target}
+            target_source = "parsed_write_target"
 
     projection_groups = select_expression_groups(parsed)
     if not projection_groups:
-        return [], [{"statement_id": statement_id, "task_id": task_id, "error": "no_select_projection"}]
+        return [], [], [{"statement_id": statement_id, "task_id": task_id, "reason": "no_select_projection"}]
 
     aliases = table_aliases(parsed)
     read_datasets = set(reads_by_stmt.get(statement_id, set()))
@@ -568,14 +620,22 @@ def extract_for_statement(
     facts = []
     errors = []
     for target_dataset in sorted(target_datasets):
+        target_columns = columns_by_dataset.get(target_dataset, [])
         for branch_ordinal, projections in enumerate(projection_groups, start=1):
             for ordinal, projection in enumerate(projections, start=1):
+                fallback_output_name = ""
+                if not (
+                    isinstance(projection, exp.Star)
+                    or (isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star))
+                ):
+                    fallback_output_name = target_columns[ordinal - 1] if ordinal <= len(target_columns) else ""
                 projected_items, projection_error = projection_facts(
                     projection,
                     aliases,
                     read_datasets,
                     columns_by_dataset,
                     cte_column_sources,
+                    fallback_output_name=fallback_output_name,
                 )
                 if projection_error:
                     errors.append(
@@ -610,11 +670,12 @@ def extract_for_statement(
                                 "branch_ordinal": branch_ordinal,
                                 "expression_sql": source.get("expression_sql") or projection.sql(dialect=dialect)[:1000],
                                 "generation_type": generation_type,
+                                "output_resolution": source.get("output_resolution", ""),
                                 "source_system": "sqlglot",
                                 "source_type": "generated_column" if generation_type else "column_lineage",
                             }
                         )
-    return facts, errors
+    return facts, errors, []
 
 
 def main() -> None:
@@ -641,8 +702,9 @@ def main() -> None:
 
     all_facts = []
     all_errors = []
+    all_skipped = []
     for stmt in statements:
-        facts, errors = extract_for_statement(
+        facts, errors, skipped = extract_for_statement(
             project_dir,
             stmt,
             details_by_task,
@@ -654,17 +716,21 @@ def main() -> None:
         )
         all_facts.extend(facts)
         all_errors.extend(errors)
+        all_skipped.extend(skipped)
 
     facts_path = project_dir / f"{args.prefix}_column_lineage.json"
     errors_path = project_dir / f"{args.prefix}_column_lineage_errors.json"
+    skipped_path = project_dir / f"{args.prefix}_column_lineage_skipped.json"
     facts_path.write_text(json.dumps(all_facts, ensure_ascii=False, indent=2))
     errors_path.write_text(json.dumps(all_errors, ensure_ascii=False, indent=2))
+    skipped_path.write_text(json.dumps(all_skipped, ensure_ascii=False, indent=2))
     summary = {
         "statement_count": len(statements),
         "column_lineage_count": len(all_facts),
         "derived_column_lineage_count": sum(1 for item in all_facts if item.get("source_dataset")),
         "generated_column_count": sum(1 for item in all_facts if item.get("generation_type")),
         "error_count": len(all_errors),
+        "skipped_count": len(all_skipped),
         "target_dataset_count": len({item["target_dataset"] for item in all_facts}),
         "source_dataset_count": len({item["source_dataset"] for item in all_facts if item["source_dataset"]}),
         "source_resolution_distribution": dict(Counter(item["source_resolution"] for item in all_facts)),
@@ -672,9 +738,14 @@ def main() -> None:
             Counter(item.get("generation_type", "") for item in all_facts if item.get("generation_type"))
         ),
         "target_resolution_distribution": dict(Counter(item["target_resolution"] for item in all_facts)),
+        "output_resolution_distribution": dict(
+            Counter(item.get("output_resolution", "") for item in all_facts if item.get("output_resolution"))
+        ),
+        "skipped_reason_distribution": dict(Counter(item["reason"] for item in all_skipped)),
         "inferred_ctas_schema_count": len(inferred_columns),
         "facts_path": str(facts_path),
         "errors_path": str(errors_path),
+        "skipped_path": str(skipped_path),
     }
     (project_dir / f"{args.prefix}_column_lineage_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2)

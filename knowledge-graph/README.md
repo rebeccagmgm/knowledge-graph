@@ -1,176 +1,274 @@
-# 大数据代码知识图谱
+# Big Data Code KG Probe
 
-本项目用于从Horae调度元数据、任务页面或运行日志中的SQL、SzConnector表元数据及指标登记信息中，逆向构建代码语义图和业务数据资产图。
+This directory contains the local prototype pipeline for building a knowledge graph from Horae scheduling metadata, runtime/page SQL, SzConnector metadata, and indicator registry facts.
 
-## 当前范围
+## Current Status
 
-- 从一个或多个结果任务ID递归穿透Horae上游依赖，直至源头。
-- 采集任务详情、调度依赖、任务页面SQL/配置及Hive运行日志。
-- `hiveTask`、`hiveTask-2.0`以运行日志SQL为准；其他任务以任务页面SQL/配置为准。
-- `sparkIndex`从任务页面的`prepare.sqls`识别写入目标，不依赖日志。
-- 使用`sqlglot`解析SQL；对带运行噪声的语句提供正则兜底。
-- 采集SzConnector DMS表和字段元数据、指标登记信息。
-- 构建任务、SQL、表、字段、指标、口径、负责人和数据分层等图事实。
-- 保守提取字段血缘，支持明确别名、单一来源表、Schema唯一匹配、星号展开和部分CTE传播。
-- 为节点和边记录来源、证据、置信度、构建批次和事实类型。
-- 生成Neo4j约束、索引、导入脚本和常用Cypher查询模板。
-- 可选调用兼容OpenAI协议的LLM，生成代码优先的指标口径，并与登记口径比较。
+The `trial_project` end-to-end prototype is complete and currently contains:
 
-Git设计态代码采集和数据服务层暂未纳入当前版本。
+- 56,619 nodes and 104,828 relationships.
+- 2,154 schedule tasks, 3,197 datasets, 44,904 columns, and 3,335 SQL statements.
+- 319 metrics, 319 code-first definitions, and 319 registered-definition comparisons.
+- A registration-driven incremental scanner with a default 48-hour interval.
 
-## 双层图模型
+The project is now at the reusable prototype stage. Multi-project validation, task-level graph patching, data-service modeling, and the formal query API remain future work.
 
-底层为代码语义图：
+See `TECHNICAL_SOLUTION.md` for the complete Chinese technical solution and current roadmap.
 
-```text
-ScheduleTask -> RuntimeLog / SqlStatement -> Dataset -> Column
-```
+## Current Scope
 
-上层为业务与数据资产图：
+- Traverse Horae upstream task lineage from one or more result task IDs.
+- Collect task detail and dependency metadata.
+- Collect task page SQL/config for non-hive tasks.
+- Collect runtime logs for `hiveTask` and `hiveTask-2.0`.
+- Parse SQL with `sqlglot`, with regex fallback for noisy runtime statements.
+- Normalize common runtime-log noise before SQL parsing, including Spark/Hive config lines, execution progress lines, and task-engine messages.
+- Merge SQL facts by strategy:
+  - `hiveTask` / `hiveTask-2.0`: runtime log SQL.
+  - Other task types: task page SQL/config.
+- Collect SzConnector DMS table metadata and indicator registry metadata.
+- Build graph JSONL facts and Neo4j Cypher import script.
+- Extract conservative column lineage and materialize table-level dependency edges.
+- Expand `*` / `alias.*` projections by DMS table schema where the source table is unambiguous.
+- Resolve CTE-projected columns conservatively when their source columns can be traced through table aliases, a single read table, or schema uniqueness.
+- Decorate graph facts with provenance, confidence, build metadata, and fact type.
+- Audit graph facts for required properties, missing endpoints, isolated nodes, confidence distribution, and metric/table coverage.
+- Export Neo4j schema constraints and indexes for common lookup fields.
+- Run offline graph query validations before Neo4j import.
+- Build optional LLM evidence bundles, generate code-first metric definitions, compare them with registered definitions, and merge the results into an enhanced graph.
 
-```text
-Project -> Metric -> MetricDefinition / CodeDefinition / DefinitionComparison
-                 -> Dataset -> DataLayer / Owner
-```
+Git repository/design-time code collection is intentionally deferred.
 
-两层通过`READS`、`WRITES`、`PRODUCES`、`CONSUMES`、`COMPUTED_BY`、`STORED_IN`、`DERIVED_FROM`等关系连接。
+## Main Pipeline
 
-## 安装
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Horae和SzConnector CLI及其认证信息由运行环境提供，不应提交到代码仓库。
-
-## 配置
-
-推荐通过环境变量配置：
+Project-level multi-root task pipeline:
 
 ```bash
-export HORAE_COOKIE="..."
-export SZCONNECTOR_COOKIE="..."
-export SZCONNECTOR_TOKEN="..."
-export KG_OUTPUT_ROOT="$PWD/artifacts/projects"
-export KG_LINEAGE_ROOT="$PWD/artifacts/lineage_batch"
-```
-
-LLM和Neo4j为可选配置：
-
-```bash
-export LLM_API_KEY="..."
-export LLM_BASE_URL="https://api.deepseek.com"
-export LLM_MODEL="deepseek-v4-pro"
-export NEO4J_PASSWORD_FILE="/安全目录/neo4j_password.txt"
-```
-
-不要提交Cookie、Token、API Key、Neo4j密码或SSH私钥。
-
-## 项目级流水线
-
-多个结果任务：
-
-```bash
-python3 kg_probe/run_project_pipeline.py \
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
   --project-id new_project \
-  --tasks 236334,212769,207174
+  --tasks 236334,212769,207174 \
+  --import-neo4j
 ```
 
-从文件读取任务ID：
+For a task file:
 
 ```bash
-python3 kg_probe/run_project_pipeline.py \
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
   --project-id new_project \
-  --task-file examples/task_ids.example.txt
+  --task-file /path/to/task_ids.txt \
+  --import-neo4j
 ```
 
-只预览命令，不访问内部服务：
+Preview the exact commands without calling internal services:
 
 ```bash
-python3 kg_probe/run_project_pipeline.py \
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
   --project-id new_project \
   --tasks 236334,212769,207174 \
   --dry-run
 ```
 
-构建LLM口径层：
+Build the optional LLM definition layer in mock mode:
 
 ```bash
-python3 kg_probe/run_project_pipeline.py \
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
   --project-id new_project \
-  --task-file examples/task_ids.example.txt \
+  --tasks 236334,212769,207174 \
+  --build-llm
+```
+
+Call an OpenAI-compatible LLM provider after setting an API key:
+
+```bash
+export OPENAI_API_KEY="..."
+export LLM_MODEL="gpt-4.1-mini"
+python3 /Applications/personal-work/kg_probe/run_project_pipeline.py \
+  --project-id new_project \
+  --tasks 236334,212769,207174 \
   --build-llm \
   --llm-provider openai-compatible
 ```
 
-在本机Neo4j运行时，可增加`--import-neo4j`。同时启用LLM时，导入增强后的`strategy_llm`图。
+`LLM_BASE_URL` can be set for a compatible internal gateway. If `--import-neo4j` is combined with `--build-llm`, the enhanced graph prefix is imported.
 
-## 主要产物
-
-- `lineage.json`：完整上游调度依赖。
-- `task_details.json`：Horae任务详情。
-- `code_artifacts_page.json`：任务页面SQL和配置。
-- `log_artifacts_full.json`：Hive任务运行日志代码。
-- `strategy_sql_statements.json`：按任务类型策略选择后的SQL。
-- `strategy_dataset_edges.json`：SQL读写表事实。
-- `strategy_column_lineage.json`：字段血缘事实。
-- `strategy_graph_nodes.jsonl`、`strategy_graph_edges.jsonl`：基础图事实。
-- `strategy_fact_audit.json`：事实完整性和连通性审计。
-- `strategy_graph_query_validation.json`：离线查询验证结果。
-- `strategy_quality_report.json`：采集、解析、构图和验证质量报告。
-- `llm/evidence_bundles.jsonl`：按指标组织的SQL、表、字段和登记口径证据。
-- `llm/code_definitions.jsonl`：代码优先的指标口径。
-- `llm/definition_comparisons.jsonl`：代码口径与登记口径比较结果。
-- `strategy_llm_graph_nodes.jsonl`、`strategy_llm_graph_edges.jsonl`：LLM增强图事实。
-
-所有真实采集产物都应保存在制品目录或对象存储中，不应提交到Git。
-
-## 验证
-
-离线验证图查询：
+Single root task legacy pipeline:
 
 ```bash
-python3 kg_probe/validate_graph_queries.py \
-  artifacts/projects/new_project \
+PYTHONPATH=/Applications/personal-work/kg-local-pydeps \
+python3 /Applications/personal-work/kg_probe/run_pipeline.py 238758
+```
+
+The current trial project was built from merged lineage for these 20 root tasks and lives at:
+
+```text
+/Applications/personal-work/kg-code-snapshots/projects/trial_project
+```
+
+## Key Artifacts
+
+- `lineage.json`: merged upstream task lineage.
+- `task_details.json`: Horae task details.
+- `code_artifacts_page.json`: task page SQL/config artifacts.
+- `log_artifacts_full.json`: runtime log artifacts for hive tasks.
+- `strategy_sql_statements.json`: selected SQL statements after strategy merge.
+- `strategy_dataset_edges.json`: SQL READ/WRITE table facts.
+- `strategy_column_lineage.json`: conservative column lineage facts.
+- `strategy_graph_nodes.jsonl`: graph nodes.
+- `strategy_graph_edges.jsonl`: graph edges.
+- `strategy_neo4j_import.cypher`: Neo4j import script.
+- `strategy_neo4j_schema.cypher`: Neo4j constraints and indexes.
+- `strategy_query_templates.cypher`: reusable Cypher query templates.
+- `strategy_quality_report.json`: collection, parse, graph, and validation report.
+- `strategy_graph_query_validation.json`: offline query validation samples.
+- `strategy_fact_audit.json`: fact completeness, provenance, and connectivity audit.
+- `llm/evidence_bundles.jsonl`: per-metric SQL/table/column/registry evidence sent to the LLM.
+- `llm/code_definition_requests.jsonl`: rendered LLM requests with template id/version/hash.
+- `llm/code_definitions.jsonl`: generated code-first metric definitions.
+- `llm/definition_comparisons.jsonl`: comparison results against registered definitions.
+- `strategy_llm_graph_nodes.jsonl`: base graph plus LLM definition facts.
+- `strategy_llm_graph_edges.jsonl`: base graph plus LLM evidence, prompt, model, and comparison relations.
+
+See `GRAPH_MODEL.md` for the fact model, confidence rules, and graph schema.
+
+See `INCREMENTAL_UPDATE.md` for registration-driven 48-hour change detection and rebuild behavior.
+
+Documentation index:
+
+- `TECHNICAL_SOLUTION.md`: overall architecture, current progress, incremental updates, and query-layer plan.
+- `PROJECT_PIPELINE.md`: full project build sequence and resume behavior.
+- `GRAPH_MODEL.md`: node, relationship, confidence, and audit definitions.
+- `INCREMENTAL_UPDATE.md`: project registration, scanning, quality gates, and rebuild behavior.
+- `QUERY_LAYER_DESIGN.md`: standard response protocol and the 12 query primitives.
+- `QUERY_LAYER_USAGE.md`: CLI and Python examples for the implemented query service.
+
+## Graph Model
+
+Main node labels:
+
+- `Project`
+- `ScheduleTask`
+- `RuntimeLog`
+- `Dataset`
+- `Column`
+- `Metric`
+- `MetricDefinition`
+- `Owner`
+- `SqlStatement`
+- `DataLayer`
+- `EvidenceBundle`
+- `PromptTemplate`
+- `PromptRun`
+- `ModelVersion`
+- `CodeDefinition`
+- `DefinitionComparison`
+
+Main edge types:
+
+- Scheduling and ownership: `HAS_ENTRY_TASK`, `DEPENDS_ON`, `OWNS`
+- Task/data relations: `PRODUCES`, `CONSUMES`, `HAS_RUNTIME_LOG`
+- SQL/data relations: `EMITS_SQL`, `READS`, `WRITES`
+- Materialized data lineage: `DATASET_DEPENDS_ON`
+- Schema and metric relations: `HAS_COLUMN`, `STORED_IN`, `COMPUTED_BY`, `HAS_DEFINITION`
+- Column lineage: `DERIVED_FROM`
+- Layering: `BELONGS_TO_LAYER`
+- LLM definition layer: `HAS_EVIDENCE_BUNDLE`, `EVIDENCES_SQL`, `EVIDENCES_DATASET`, `EVIDENCES_COLUMN`, `HAS_CODE_DEFINITION`, `GENERATED_BY`, `USED_TEMPLATE`, `USED_EVIDENCE`, `USED_MODEL`, `HAS_COMPARISON`, `COMPARES_CODE_DEFINITION`, `COMPARES_REGISTERED_DEFINITION`
+
+Direction convention:
+
+- `target Dataset -[:DATASET_DEPENDS_ON]-> source Dataset`
+- `target Column -[:DERIVED_FROM]-> source Column`
+- `downstream ScheduleTask -[:DEPENDS_ON]-> upstream ScheduleTask`
+
+## Validation
+
+Run offline validation:
+
+```bash
+python3 /Applications/personal-work/kg_probe/validate_graph_queries.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project \
   --prefix strategy
 ```
 
-导入并验证Neo4j：
+Run query template export:
 
 ```bash
-python3 kg_probe/import_and_validate_neo4j.py \
-  artifacts/projects/new_project \
+python3 /Applications/personal-work/kg_probe/export_query_templates.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project \
+  --prefix strategy
+```
+
+Build only the LLM layer for an already-built graph:
+
+```bash
+python3 /Applications/personal-work/kg_probe/build_llm_evidence.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project \
+  --prefix strategy
+python3 /Applications/personal-work/kg_probe/generate_llm_requests.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project
+python3 /Applications/personal-work/kg_probe/generate_code_definitions.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project \
+  --provider mock
+python3 /Applications/personal-work/kg_probe/compare_definitions.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project \
+  --provider mock
+python3 /Applications/personal-work/kg_probe/merge_llm_facts.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project \
   --prefix strategy \
-  --password-file "$NEO4J_PASSWORD_FILE" \
+  --output-prefix strategy_llm
+```
+
+## Neo4j Import
+
+Neo4j was installed with Homebrew for local validation:
+
+```bash
+/opt/homebrew/bin/brew install neo4j
+/opt/homebrew/opt/neo4j/bin/neo4j console
+```
+
+The local admin password for this prototype is stored at:
+
+```text
+/Applications/personal-work/kg-code-snapshots/neo4j_password.txt
+```
+
+Batch import and validate:
+
+```bash
+PYTHONPYCACHEPREFIX=/private/tmp/kg-pycache \
+python3 /Applications/personal-work/kg_probe/import_and_validate_neo4j.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project \
+  --prefix strategy \
   --batch-size 2000
 ```
 
-## 已知限制
+Re-run validation without re-importing:
 
-- 字段血缘采用保守策略，无法确认来源时不会强行连边。
-- `select *`展开依赖准确的DMS表字段元数据。
-- 多语句临时表、复杂动态SQL和变量替换仍需更强的中间表示。
-- 运行日志可能包含引擎噪声或不完整DDL，表级血缘会尽量由正则兜底保留。
-- 指标登记信息不是绝对事实；冲突时以代码和表元数据为准。
-- LLM结论需要保留证据和模型版本，不应直接替代人工治理。
-- 当前尚未建设数据服务节点和正式查询服务层。
-- 当前Neo4j导入为全量替换，生产化前需补充增量更新和回滚机制。
+```bash
+PYTHONPYCACHEPREFIX=/private/tmp/kg-pycache \
+python3 /Applications/personal-work/kg_probe/import_and_validate_neo4j.py \
+  /Applications/personal-work/kg-code-snapshots/projects/trial_project \
+  --prefix strategy \
+  --skip-import
+```
 
-## 已规避的流水线问题
+## Known Limits
 
-- SQL合并和字段血缘尚未稳定时，不并行构图。
-- 先构建初始图，以任务`PRODUCES`关系辅助识别目标表，再提取字段血缘。
-- 字段解析可能发现新表，因此SzConnector元数据需要在字段血缘前后分别补采。
-- 大项目使用批量刷盘，避免每查询一张表就重写完整DMS文件。
-- 只有Hive任务读取运行日志；其他任务读取任务页面代码。
-- Neo4j导入保持可选，离线阶段也能完成事实审计和查询验证。
+- Column lineage is intentionally conservative. Unqualified columns are resolved only when table aliases, single-read-dataset context, or DMS schema uniqueness make the source unambiguous.
+- `select *` expansion depends on DMS exact table metadata. Tables without exact DMS columns cannot be expanded safely.
+- CTE lineage currently covers conservative projected-column propagation. Multi-statement temporary table chains and dynamic SQL variables still need a stronger intermediate representation.
+- Some SQL parse errors are expected from runtime logs that contain engine noise or DDL fragments. Regex fallback preserves table-level facts where possible.
+- Indicator registry is useful but not authoritative. Code and table metadata should win when definitions conflict.
+- LLM definition generation is optional. Mock mode validates the pipeline but does not produce authoritative metric logic.
+- Data services are not modeled yet.
+- Neo4j has been installed and validated locally. The Homebrew daemon mode exited in this environment, while `neo4j console` works and keeps the service alive for validation.
 
-更完整的图模型见[GRAPH_MODEL.md](GRAPH_MODEL.md)，流水线说明见[PROJECT_PIPELINE.md](PROJECT_PIPELINE.md)。
+## Pipeline Pitfalls Avoided
 
-总体技术方案见[TECHNICAL_SOLUTION.md](TECHNICAL_SOLUTION.md)，增量更新操作见[INCREMENTAL_UPDATE.md](INCREMENTAL_UPDATE.md)。
-
-查询层统一协议和12个查询原语见[QUERY_LAYER_DESIGN.md](QUERY_LAYER_DESIGN.md)。
-
-查询层CLI和Python调用示例见[QUERY_LAYER_USAGE.md](QUERY_LAYER_USAGE.md)。
+- Do not build graph in parallel with SQL merge or column-lineage extraction; graph building must read stable upstream artifacts.
+- Build an initial graph before column lineage so task-level `PRODUCES` facts can identify target datasets.
+- Run SzConnector metadata collection once after the initial graph and again after column lineage, because column parsing can reveal additional datasets.
+- Use `--flush-every` for SzConnector metadata collection; writing the full DMS JSON after every table becomes very slow.
+- Keep Neo4j import optional. If `--import-neo4j` is not used, `strategy_quality_report.json` marks stale Neo4j validation when database counts do not match current JSONL graph counts.
+- Use `hiveTask,hiveTask-2.0` runtime logs only for hive tasks; other task types use task-page SQL/config.
+- `sparkIndex` writes are read from task-page `prepare.sqls`; logs are not required for that class.
