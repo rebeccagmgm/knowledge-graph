@@ -1,80 +1,81 @@
-# Knowledge Graph Fact Model
+# 知识图谱事实模型
 
-## Layer Boundary
+## 分层边界
 
-The prototype separates the pipeline into:
+原型工程将链路拆成五层：
 
-- Collection layer: raw task, log, SQL/config, DMS, and indicator registry artifacts.
-- Parsing layer: normalized SQL statements plus table and column lineage facts.
-- Fact layer: graph-ready entities and relationships with provenance, confidence, and evidence metadata.
-- Graph layer: Neo4j schema, JSONL graph facts, import scripts, validation queries, and Cypher templates.
-- LLM definition layer: optional evidence bundles, prompt/model runs, code-first metric definitions, and comparisons against registered definitions.
+- 采集层：保存原始任务、日志、SQL/配置、DMS、指标登记等采集产物。
+- 解析层：生成规范化 SQL 语句、表级血缘和字段级血缘事实。
+- 事实层：将实体和关系整理成可入图事实，并补充来源、置信度和证据元数据。
+- 图谱层：维护 Neo4j schema、JSONL 图事实、导入脚本、校验查询和 Cypher 模板。
+- LLM 口径层：可选构建指标证据包、Prompt/模型调用记录、代码优先指标口径和登记口径比对结果。
 
-## Universal Fact Properties
+## 通用事实属性
 
-Every graph node and edge is decorated with:
+所有图节点和边都会补充以下属性：
 
-- `fact_type`: semantic category, such as `table_lineage`, `column_lineage`, `business_metric`, or `schedule_task`.
-- `project_key`: project/root lineage key.
-- `graph_prefix`: fact set prefix, for example `strategy`.
-- `build_id`: graph build identifier.
-- `built_at`: build timestamp.
-- `confidence`: `high`, `medium`, `low`, or `unknown`.
-- `inferred`: whether the fact was inferred rather than directly collected.
+- `fact_type`：语义类别，例如 `table_lineage`、`column_lineage`、`business_metric`、`schedule_task`。
+- `project_key`：项目或根血缘标识。
+- `graph_prefix`：事实集合前缀，例如 `strategy`。
+- `build_id`：图谱构建批次标识。
+- `built_at`：构建时间。
+- `confidence`：置信度，取值为 `high`、`medium`、`low` 或 `unknown`。
+- `inferred`：是否为推断事实，而不是直接采集事实。
 
-Edges additionally include:
+边会额外包含：
 
 - `evidence_from_id`
 - `evidence_to_id`
 
-Specific edge types also carry statement, task, source-resolution, or target-resolution evidence.
+部分边类型还会携带 SQL 语句、调度任务、源字段解析方式或目标表解析方式等证据属性。
 
-## Core Nodes
+## 核心节点
 
-- `Project`: one KG project snapshot.
-- `ScheduleTask`: Horae scheduling task.
-- `RuntimeLog`: runtime log artifact.
-- `SqlStatement`: normalized SQL statement artifact.
-- `Dataset`: table/data asset.
-- `Column`: dataset column.
-- `Metric`: indicator registry metric.
-- `MetricDefinition`: indicator registry definition text.
-- `Owner`: owner/developer/designer.
-- `DataLayer`: `odata`, `pdata`, `dm_index_n`, `dm`, `other`, `root_unknown`.
-- `EvidenceBundle`: per-metric evidence assembled from graph facts, SQL snippets, read/write tables, target columns, and registry text.
-- `PromptTemplate`: versioned prompt template. The template text is stored once with a hash.
-- `PromptRun`: one model invocation or mock invocation for definition generation or definition comparison.
-- `ModelVersion`: provider/model identity used by a prompt run.
-- `CodeDefinition`: code-first metric definition generated from SQL and graph evidence.
-- `DefinitionComparison`: comparison between code-first and registered definitions.
+- `Project`：一个项目图谱快照。
+- `ScheduleTask`：Horae 调度任务。
+- `RuntimeLog`：运行日志产物。
+- `SqlStatement`：规范化 SQL 语句。
+- `Dataset`：表或数据资产。
+- `Column`：表字段。
+- `Metric`：指标登记系统中的指标。
+- `MetricDefinition`：指标登记口径文本。
+- `Owner`：负责人、开发人、设计人等。
+- `DataLayer`：数据层级，包括 `odata`、`pdata`、`dm_index_n`、`dm`、`other`、`root_unknown`。
+- `GeneratedExpression`：没有真实源字段的生成字段表达式。
+- `EvidenceBundle`：每个指标的证据包，由图事实、SQL 片段、读写表、目标字段和登记口径组成。
+- `PromptTemplate`：版本化 Prompt 模板。模板正文只存一份，并记录哈希。
+- `PromptRun`：一次真实模型调用或 mock 调用。
+- `ModelVersion`：PromptRun 使用的 provider/model 标识。
+- `CodeDefinition`：基于 SQL 和图证据生成的代码优先指标口径。
+- `DefinitionComparison`：代码口径与登记口径的比对结果。
 
-## Core Edges
+## 核心边
 
-Scheduling:
+调度：
 
 - `Project -[:HAS_ENTRY_TASK]-> ScheduleTask`
 - `downstream ScheduleTask -[:DEPENDS_ON]-> upstream ScheduleTask`
 
-Task/data:
+任务和数据：
 
 - `ScheduleTask -[:PRODUCES]-> Dataset`
 - `ScheduleTask -[:CONSUMES]-> Dataset`
 - `ScheduleTask -[:HAS_RUNTIME_LOG]-> RuntimeLog`
 - `ScheduleTask -[:EMITS_SQL]-> SqlStatement`
 
-SQL/table lineage:
+SQL 和表血缘：
 
 - `SqlStatement -[:READS]-> Dataset`
 - `SqlStatement -[:WRITES]-> Dataset`
 - `target Dataset -[:DATASET_DEPENDS_ON]-> source Dataset`
 
-Column lineage:
+字段血缘：
 
 - `Dataset -[:HAS_COLUMN]-> Column`
 - `target Column -[:DERIVED_FROM]-> source Column`
 - `target Column -[:GENERATED_BY_EXPRESSION]-> GeneratedExpression`
 
-Metric/business:
+指标和业务：
 
 - `Metric -[:STORED_IN]-> Dataset`
 - `Metric -[:COMPUTED_BY]-> ScheduleTask`
@@ -82,7 +83,7 @@ Metric/business:
 - `Metric -[:HAS_EVIDENCE_BUNDLE]-> EvidenceBundle`
 - `Metric -[:HAS_CODE_DEFINITION]-> CodeDefinition`
 
-LLM evidence and generation:
+LLM 证据和生成：
 
 - `EvidenceBundle -[:EVIDENCES_SQL]-> SqlStatement`
 - `EvidenceBundle -[:EVIDENCES_DATASET]-> Dataset`
@@ -96,151 +97,140 @@ LLM evidence and generation:
 - `DefinitionComparison -[:COMPARES_CODE_DEFINITION]-> CodeDefinition`
 - `DefinitionComparison -[:COMPARES_REGISTERED_DEFINITION]-> MetricDefinition`
 
-Ownership/layering:
+归属和分层：
 
 - `Owner -[:OWNS]-> ScheduleTask | Dataset | Metric`
 - `Dataset | ScheduleTask -[:BELONGS_TO_LAYER]-> DataLayer`
 
-## Confidence Rules
+## 置信度规则
 
-High confidence:
+高置信度：
 
-- Direct Horae scheduling dependencies.
-- Direct DMS table/column metadata.
-- Direct indicator registry storage/definition facts.
-- SQLGlot parsed `READS` / `WRITES`.
-- Column lineage from explicit table aliases.
+- Horae 直接调度依赖。
+- DMS 直接表/字段元数据。
+- 指标登记系统中的存储表和登记口径。
+- SQLGlot 解析出的 `READS` / `WRITES`。
+- 来自显式表别名的字段血缘。
 
-Medium confidence:
+中置信度：
 
-- Dataset dependency inferred from schedule dependency outputs.
-- Column lineage from single-read-table context, schema-unique column matching, star expansion, or CTE propagation.
-- Metric compute task inferred from metric storage dataset producer.
-- Ownership and layer rules derived from metadata/name conventions.
-- LLM output from real model calls unless later promoted by human review.
+- 根据调度依赖和产出表推断的数据集依赖。
+- 根据单读表上下文、schema 唯一字段匹配、星号展开或 CTE 传播得到的字段血缘。
+- 根据指标存储表生产任务推断的指标计算任务。
+- 根据元数据或命名规则推断的负责人、数据层级。
+- 真实模型生成的 LLM 口径，除非后续被人工确认提升置信度。
 
-Low confidence:
+低置信度：
 
-- Mock LLM definitions and comparisons.
-- Reserved for unresolved or weakly inferred facts. Current graph build does not emit low-confidence `DERIVED_FROM` edges.
+- mock 模型生成的口径和比对。
+- 为弱推断或未解决事实预留。目前图构建不会输出低置信度 `DERIVED_FROM` 边。
 
-## Generated Column Values
+## 生成字段值
 
-Some target fields are not derived from source table columns. Examples include fixed values
-(`'RCC' AS data_src_cd`), blank placeholders (`'' AS remark`), partition values, and runtime
-expressions (`from_unixtime(unix_timestamp()) AS data_time`).
+部分目标字段不是来自源表字段，例如固定值、空字符串占位、分区值和运行时表达式：
 
-These are modeled explicitly instead of being counted as column-lineage errors:
+- `'RCC' AS data_src_cd`
+- `'' AS remark`
+- `from_unixtime(unix_timestamp()) AS data_time`
 
-- Node: `GeneratedExpression`
-- Edge: `Column -[:GENERATED_BY_EXPRESSION]-> GeneratedExpression`
-- Key properties:
-  - `generation_type`: `literal`, `generated_expression`, or `system_expression`
-  - `expression_sql`: the SQL expression text
+这些字段不会被当作字段血缘解析错误，而是显式建模：
+
+- 节点：`GeneratedExpression`
+- 边：`Column -[:GENERATED_BY_EXPRESSION]-> GeneratedExpression`
+- 关键属性：
+  - `generation_type`：`literal`、`generated_expression` 或 `system_expression`
+  - `expression_sql`
   - `statement_id`
   - `task_id`
   - `projection_ordinal`
 
-True source-field lineage remains represented only by `DERIVED_FROM`.
+真实源字段血缘仍只通过 `DERIVED_FROM` 表示。
 
-## Hive-To-External Sync Tasks
+## Hive 到外部库同步任务
 
-`hive2*` tasks, such as `hive2oracle` and `hive2postgre`, are modeled as data sync/export tasks.
-Their output is the non-Hive target table recorded in Horae sync metadata, not the task name.
+`hive2*` 类任务，例如 `hive2oracle`、`hive2postgre`，被建模为数据同步/导出任务。它们的产出不是任务名，而是 Horae 同步元数据中记录的非 Hive 目标表。
 
-Table-level facts:
+表级事实：
 
 - `ScheduleTask -[:CONSUMES]-> Hive Dataset`
 - `ScheduleTask -[:PRODUCES]-> External Dataset`
 
-Column-level facts:
+字段级事实：
 
 - `External Column -[:DERIVED_FROM]-> Hive Column`
 
-The edge property `target_resolution = "task_sync_target"` indicates that the target table came
-from `sync_info["目标库表"]`.
+边属性 `target_resolution = "task_sync_target"` 表示目标表来自 `sync_info["目标库表"]`。
 
-## CTAS, UNION, And Star Expansion
+## CTAS、UNION 和星号展开
 
-For `CREATE TABLE ... AS SELECT ...`, the created table is used as the column-lineage target when
-it can be identified from SQL text. These facts use:
+对于 `CREATE TABLE ... AS SELECT ...`，如果能从 SQL 文本识别出创建表，则将该表作为字段血缘目标。相关事实使用：
 
 - `target_resolution = "ctas_target"`
 
-For `UNION` / `UNION ALL`, each branch is treated as a separate projection source. Column-lineage
-edges include:
+对于 `UNION` / `UNION ALL`，每个分支会作为独立投影来源处理。字段血缘边包含：
 
 - `branch_ordinal`
 - `projection_ordinal`
 
-For star projections such as `A.*` and `B.*`, expansion uses, in order:
+对于 `A.*`、`B.*` 等星号投影，展开顺序为：
 
-- registered DMS column metadata;
-- inferred CTAS schemas from previous statements in the project;
-- unique table-name suffix matching for unqualified table references.
+- DMS 登记字段元数据。
+- 项目内前序 CTAS 语句推断出的 schema。
+- 对未限定表引用做唯一表名后缀匹配。
 
-Star-derived edges use:
+星号展开产生的边使用：
 
 - `source_resolution = "schema_star_expand"`
 
-## LLM Audit Trail
+## LLM 审计链路
 
-The LLM layer deliberately separates reusable prompt templates from per-metric runs:
+LLM 口径层刻意区分可复用 Prompt 模板和每个指标的实际调用：
 
-- Prompt templates are stored once as `PromptTemplate` nodes with `template_id`, `version`, and `template_hash`.
-- Each metric run stores `PromptRun` metadata: provider, model, status, time, input hash, used template, and used evidence bundle.
-- SQL evidence is stored in `llm/evidence_bundles.jsonl`; the graph node keeps counts and hashes, while `EVIDENCES_*` edges connect back to original SQL/table/column facts.
-- `CodeDefinition.definition_json` and `DefinitionComparison.comparison_json` preserve structured model output.
+- Prompt 模板以 `PromptTemplate` 节点保存，包含 `template_id`、`version` 和 `template_hash`。
+- 每个指标调用保存为 `PromptRun`，记录 provider、model、状态、时间、输入哈希、使用的模板和证据包。
+- SQL 证据保存在 `llm/evidence_bundles.jsonl`；图节点保存数量和哈希，`EVIDENCES_*` 边连接回原始 SQL、表、字段事实。
+- `CodeDefinition.definition_json` 和 `DefinitionComparison.comparison_json` 保留结构化模型输出。
 
-This keeps every result reproducible without duplicating the full prompt text on every metric.
+这样可以复现每次结果，同时避免在每个指标节点上重复保存完整 Prompt 正文。
 
-## Quality Audits
+## 质量审计
 
-`audit_graph_facts.py` checks:
+`audit_graph_facts.py` 检查：
 
-- Missing node/edge endpoints.
-- Missing required fact properties.
-- Isolated nodes.
-- Node/edge confidence distributions.
-- Node/edge fact type distributions.
-- Datasets without columns.
-- Metrics without storage or compute task.
-- Low-confidence column lineage.
+- 节点/边缺失端点。
+- 必填事实属性缺失。
+- 孤立节点。
+- 节点/边置信度分布。
+- 节点/边事实类型分布。
+- 缺少字段的表。
+- 缺少存储表或计算任务的指标。
+- 低置信度字段血缘。
 
-Current `trial_project` audit:
+当前典型 LLM 增强图审计结果：
 
-- Missing endpoints: `0`
-- Missing required node props: `0`
-- Missing required edge props: `0`
-- Isolated nodes: `0`
-- Metrics without storage: `0`
-- Metrics without compute task: `10`
-- Low-confidence `DERIVED_FROM`: `0`
+- 缺失端点：`0`
+- 缺失必填节点属性：`0`
+- 缺失必填边属性：`0`
+- 孤立节点：`0`
+- LLM 生成失败剩余：`0`
+- LLM 比对失败剩余：`0`
 
-Current LLM-enhanced graph:
-
-- Nodes: `56,619`
-- Relationships: `104,828`
-- `CodeDefinition`: `319`
-- `DefinitionComparison`: `319`
-- LLM generation failures remaining: `0`
-- LLM comparison failures remaining: `0`
-
-Incremental `SourceSnapshot`, `ChangeSet`, and scan state are currently operational JSON artifacts rather than Neo4j nodes. They can be promoted into the graph later if historical change queries become a formal requirement.
+增量更新中的 `SourceSnapshot`、`ChangeSet` 和扫描状态目前是运行态 JSON 产物，尚未提升为 Neo4j 节点。如果后续需要查询历史变更，可再正式入图。
 
 ## Neo4j Schema
 
-`export_neo4j_schema.py` creates constraints/indexes for:
+`export_neo4j_schema.py` 会为以下字段创建约束或索引：
 
 - `KGNode.id`
-- `Dataset.name`
-- `ScheduleTask.task_id`
-- `SqlStatement.statement_id`
-- `Metric.metric_id`
-- `Owner.name`
-- LLM template, run, evidence, definition, and comparison ids
-- Dataset layer/db fields
-- Column `(dataset, name)`
-- Task type/layer
-- Metric Chinese/English names
-- Fact `build_id` and `fact_type`
+- `Dataset` 的项目内表名唯一约束
+- `ScheduleTask` 的项目内任务 ID 唯一约束
+- `SqlStatement` 的项目内语句 ID 唯一约束
+- `Metric` 的项目内指标 ID 唯一约束
+- `Owner` 的项目内名称唯一约束
+- LLM 模板、调用、证据、口径和比对 ID
+- Dataset 层级和库名字段
+- Column 的 `(dataset, name)`
+- Task 类型和层级
+- Metric 中文名和英文名
+- 事实 `build_id` 和 `fact_type`
+- `KGNode` 全文索引 `kg_entity_search`

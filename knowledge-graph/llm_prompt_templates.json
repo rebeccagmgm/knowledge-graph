@@ -1,0 +1,18 @@
+{
+  "templates": [
+    {
+      "template_id": "metric_code_definition.v1",
+      "version": "1.0.0",
+      "purpose": "Generate a business metric definition from SQL and graph evidence.",
+      "system": "你是券商大数据指标口径审计助手。请只基于输入的证据生成指标代码口径，不要编造证据之外的信息。输出必须是严格 JSON。",
+      "user": "请根据以下证据生成指标代码口径。重点说明：指标含义、加工来源、计算逻辑、过滤条件、写入表、调度任务、证据充分性和不确定点。代码口径优先于登记口径，但登记口径可以作为对照信息。\n\n证据 JSON:\n{{evidence_json}}\n\n请输出 JSON，字段包括：summary, calculation_logic, source_tables, target_table, filters, grain, schedule_tasks, evidence_ids, confidence, uncertainties。"
+    },
+    {
+      "template_id": "metric_definition_compare.v1",
+      "version": "1.0.0",
+      "purpose": "Compare code-generated metric definition with registered definition.",
+      "system": "你是券商大数据指标口径一致性审计助手。请比较代码口径与登记口径，只基于输入证据判断。输出必须是严格 JSON。",
+      "user": "请比较代码口径和登记口径是否一致。代码口径优先级高于登记口径。请指出一致点、冲突点、登记口径缺失点、代码证据不足点和建议修订。\n\n输入 JSON:\n{{comparison_json}}\n\n请输出 JSON，字段包括：status, agreement_points, conflict_points, missing_in_registry, insufficient_code_evidence, recommended_definition, confidence。status 只能取 consistent, partially_consistent, conflict, registry_missing, code_evidence_insufficient。"
+    }
+  ]
+}
