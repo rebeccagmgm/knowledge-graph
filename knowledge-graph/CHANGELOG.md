@@ -1,5 +1,7 @@
 # 变更记录
 
+本文件采用追加式记录：最新变更放在前面，历史阶段和关键优化继续保留，避免只剩当前版本状态。
+
 ## 2026-07-21 查询层与多项目导入
 
 ### 变更
@@ -34,6 +36,131 @@
   - 受影响表：`21`
   - 受影响任务：`32`
   - 受影响指标：`0`
+
+## 历史里程碑
+
+### 项目立项与双层图方案
+
+- 明确图谱采用“双层图”：
+  - 底层：代码语义图，包括任务、SQL、表、字段、字段血缘、运行日志。
+  - 上层：业务/数据资产图，包括指标、指标登记口径、代码口径、数据层级、负责人。
+  - 中间通过 `READS`、`WRITES`、`PRODUCES`、`CONSUMES`、`DEPENDS_ON`、`STORED_IN`、`COMPUTED_BY`、`OWNS`、`HAS_CODE_DEFINITION` 等边连接。
+- 明确券商大数据分层口径：
+  - `odata -> pdata -> dm_index_n -> dm -> 数据服务`
+  - 数据服务层暂缓建模，先把采集、解析、事实和图谱层做扎实。
+- 明确代码优先原则：
+  - 指标口径以代码和表元信息为主。
+  - 登记口径作为重要参考，但不是最终裁决来源。
+
+### 采集层建设
+
+- 建立从结果任务 ID 反向穿透上游调度链路的采集流程。
+- 支持多根任务 ID 合并成项目级血缘。
+- 采集 Horae 任务详情、上下游依赖、任务页面 SQL/配置、运行日志。
+- 明确不同任务类型的代码来源策略：
+  - `hiveTask`、`hiveTask-2.0`：从运行日志解析 SQL。
+  - `sparkIndex` 等非 Hive 任务：优先从任务页面获取 SQL/配置。
+  - 获取不到页面代码时，再考虑运行日志兜底。
+- 支持 SzConnector 表元数据、表字段、指标登记信息采集。
+- 暂缓 Git repo 设计态代码采集。
+
+### SQL 解析与事实层建设
+
+- 建立 SQL 解析链路：
+  - 清洗运行日志噪声。
+  - 使用 `sqlglot` 解析 SQL。
+  - 对异常 SQL 片段使用保守兜底。
+- 输出标准化 SQL 事实：
+  - `SqlStatement`
+  - `READS`
+  - `WRITES`
+  - 表级依赖
+  - 字段级血缘
+- 构建图谱 JSONL：
+  - `strategy_graph_nodes.jsonl`
+  - `strategy_graph_edges.jsonl`
+- 增加事实审计：
+  - 缺失端点检查。
+  - 必填属性检查。
+  - 孤立节点检查。
+  - 置信度分布。
+  - 指标/表覆盖情况。
+
+### Neo4j 图谱层
+
+- 本地安装并验证 Neo4j。
+- 增加 Neo4j schema、约束、索引和导入脚本。
+- 支持离线图查询校验和真实 Neo4j 导入校验。
+- 确认首个项目图谱可以支持：
+  - 调度依赖查询。
+  - 表级血缘查询。
+  - 字段影响分析。
+  - 指标上下文查询。
+
+### LLM 指标口径层
+
+- 设计并实现 LLM 口径生成流程：
+  - 为每个指标组织 SQL、表、字段、任务、登记口径证据包。
+  - 生成代码优先指标口径。
+  - 将代码口径与登记口径比对。
+  - 保存模型名称、证据哈希、Prompt 模板版本和结构化输出。
+- 明确 Prompt 模板统一维护在 `llm_prompt_templates.json`，不需要每个指标重复保存完整模板正文。
+- 支持 OpenAI 兼容模型接口，已验证 DeepSeek 调用链路。
+- 将 LLM 口径事实合并进增强图：
+  - `EvidenceBundle`
+  - `PromptTemplate`
+  - `PromptRun`
+  - `ModelVersion`
+  - `CodeDefinition`
+  - `DefinitionComparison`
+
+### 增量更新设计
+
+- 建立轻量项目登记表方案：
+  - 用户维护项目根任务 ID 和补充任务 ID。
+  - 系统定期扫描对应任务、依赖和 SQL 是否变化。
+- 第一版增量更新采用“发现语义变化后重建项目”，暂不做逐任务 Neo4j patch。
+- 对比维度包括：
+  - 任务元信息。
+  - 调度依赖。
+  - 原始代码哈希。
+  - 规范化 SQL 语义哈希。
+- 增量扫描产物包括：
+  - `incremental/current_snapshot.json`
+  - `incremental/state.json`
+
+### 查询层设计
+
+- 设计标准返回协议：
+  - `status`
+  - `answer`
+  - `data`
+  - `entities`
+  - `paths`
+  - `evidence`
+  - `warnings`
+  - `graph_context`
+  - `page`
+- 设计并实现 12 个查询原语：
+  - `search_entities`
+  - `resolve_entity`
+  - `get_metric_context`
+  - `get_task_context`
+  - `get_dataset_context`
+  - `get_column_context`
+  - `trace_upstream`
+  - `trace_downstream`
+  - `analyze_impact`
+  - `compare_metric_definitions`
+  - `find_definition_issues`
+  - `explain_lineage_path`
+- 将查询层定位为后续人、智能体和大模型共同使用的能力层，而不是只服务一个前端页面。
+
+### 前端探索与收敛
+
+- 曾实现过轻量看板和问答页面原型，用于展示项目资产概览、局部图谱和问答入口。
+- 后续评估认为前端方案还不够贴合最终形态，决定先删除 dashboard 前端代码。
+- 当前保留 HTTP 查询接口和原子查询能力，前端或机器人后续基于接口重新设计。
 
 ## 2026-07-14 字段血缘生成表达式
 

@@ -139,6 +139,7 @@ python3 /Applications/personal-work/kg_probe/run_pipeline.py 238758
 ## 文档索引
 
 - `TECHNICAL_SOLUTION.md`：整体架构、当前进度、增量更新和查询层方案。
+- `PROJECT_KG_BUILD_GUIDE.md`：从结果任务 ID 构建项目知识图谱的操作指引。
 - `PROJECT_PIPELINE.md`：项目级流水线、断点复用和产物说明。
 - `GRAPH_MODEL.md`：节点、边、置信度和审计定义。
 - `INCREMENTAL_UPDATE.md`：项目登记、扫描、质量门禁和重建行为。
