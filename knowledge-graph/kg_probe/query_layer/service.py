@@ -6,7 +6,7 @@ import re
 import time
 from pathlib import Path
 
-from .contracts import CONFIDENCE_RANK, compact_properties, response, validate_common, warning
+from .contracts import CONFIDENCE_RANK, compact_properties, encode_cursor, response, validate_common, warning
 
 
 TYPE_TO_LABEL = {
@@ -39,6 +39,7 @@ TRACE_RELATIONS = {
 
 CHANGE_TYPES = {"drop", "rename", "type_change", "logic_change", "stop_production", "schedule_change"}
 ISSUE_TYPES = {"conflict", "partially_consistent", "code_evidence_insufficient", "registry_missing", "manual_review_required", "consistent"}
+FULLTEXT_SAFE = re.compile(r"[^\w\u4e00-\u9fff]+")
 
 
 def _node_type(node: dict) -> str:
@@ -175,6 +176,30 @@ class QueryService:
         q = query.strip().lower()
         if not q:
             raise ValueError("query is required")
+        fulltext_query = " ".join(token for token in FULLTEXT_SAFE.split(query.strip()) if token)
+        if fulltext_query:
+            try:
+                rows = self.store.query(
+                    """
+                    CALL db.index.fulltext.queryNodes('kg_entity_search', $fulltext_query) YIELD node, score
+                    WHERE node:KGNode
+                      AND node.project_key = $project_id
+                      AND any(label IN labels(node) WHERE label IN $labels)
+                    RETURN node AS n, score
+                    ORDER BY score DESC, node.id
+                    LIMIT $limit
+                    """,
+                    {
+                        "project_id": project_id,
+                        "labels": labels,
+                        "fulltext_query": fulltext_query,
+                        "limit": limit,
+                    },
+                )
+                if rows:
+                    return rows
+            except Exception:
+                pass
         rows = self.store.query(
             """
             MATCH (n:KGNode {project_key: $project_id})
@@ -238,6 +263,13 @@ class QueryService:
         rows = self.store.query(
             "MATCH (n:KGNode {id: $entity_id, project_key: $project_id}) RETURN n LIMIT 1",
             {"entity_id": entity_id, "project_id": project_id},
+        )
+        if rows:
+            return rows[0]["n"]
+        namespaced_id = f"{project_id}::{entity_id}"
+        rows = self.store.query(
+            "MATCH (n:KGNode {id: $entity_id, project_key: $project_id}) RETURN n LIMIT 1",
+            {"entity_id": namespaced_id, "project_id": project_id},
         )
         return rows[0]["n"] if rows else None
 
@@ -591,6 +623,153 @@ class QueryService:
                 related.extend(item for item in rows[0]["tasks"] if item)
         return related
 
+    def _impact_sample_paths(self, node: dict, req: dict) -> tuple[list[dict], list[dict], list[dict]]:
+        path_limit = min(int(req.get("path_limit", 20)), req["limit"], 100)
+        if path_limit <= 0:
+            return [], [], []
+        sample_req = dict(req)
+        sample_req["limit"] = path_limit
+        return self._trace(node, "downstream", sample_req)
+
+    def _impact_aggregate(self, node: dict, req: dict) -> tuple[dict, list[dict]]:
+        entity_type = _node_type(node)
+        params = {
+            "id": node["id"],
+            "project_id": req["project_id"],
+            "hops": req["max_hops"],
+            "limit": req["limit"],
+        }
+        if entity_type == "column":
+            rows = self.store.query(
+                """
+                MATCH (subject:Column {id: $id, project_key: $project_id})
+                OPTIONAL MATCH (subject_dataset:Dataset {project_key: $project_id})-[:HAS_COLUMN]->(subject)
+                OPTIONAL MATCH path=(subject)<-[:DERIVED_FROM*1..50]-(down_col:Column {project_key: $project_id})
+                WHERE length(path) <= $hops
+                WITH subject, collect(DISTINCT subject_dataset) AS subject_datasets, collect(DISTINCT down_col) AS affected_columns
+                OPTIONAL MATCH (affected_dataset:Dataset {project_key: $project_id})-[:HAS_COLUMN]->(affected_column:Column)
+                WHERE affected_column IN affected_columns
+                WITH subject, affected_columns, subject_datasets, collect(DISTINCT affected_dataset) AS downstream_datasets
+                WITH subject, affected_columns, subject_datasets + downstream_datasets AS affected_datasets
+                OPTIONAL MATCH (producer:ScheduleTask {project_key: $project_id})-[:PRODUCES]->(produced:Dataset)
+                WHERE produced IN affected_datasets
+                WITH subject, affected_columns, affected_datasets, collect(DISTINCT producer) AS producer_tasks
+                OPTIONAL MATCH (consumer:ScheduleTask {project_key: $project_id})-[:CONSUMES]->(consumed:Dataset)
+                WHERE consumed IN affected_datasets
+                WITH subject, affected_columns, affected_datasets, producer_tasks, collect(DISTINCT consumer) AS consumer_tasks
+                OPTIONAL MATCH (sql_consumer:ScheduleTask {project_key: $project_id})-[:EMITS_SQL]->(:SqlStatement)-[:READS]->(sql_consumed:Dataset)
+                WHERE sql_consumed IN affected_datasets
+                WITH subject, affected_columns, affected_datasets, producer_tasks, consumer_tasks, collect(DISTINCT sql_consumer) AS sql_consumer_tasks
+                OPTIONAL MATCH (metric:Metric {project_key: $project_id})-[:STORED_IN]->(metric_dataset:Dataset)
+                WHERE metric_dataset IN affected_datasets
+                WITH subject, affected_columns, affected_datasets, producer_tasks + consumer_tasks + sql_consumer_tasks AS impact_tasks, collect(DISTINCT metric) AS metrics
+                OPTIONAL MATCH (subject)<-[rels:DERIVED_FROM*1..50]-(:Column {project_key: $project_id})
+                WHERE size(rels) <= $hops
+                UNWIND rels AS rel
+                WITH subject, affected_columns, affected_datasets, impact_tasks, metrics,
+                     collect(DISTINCT rel.task_id) AS lineage_task_ids
+                OPTIONAL MATCH (lineage_task:ScheduleTask {project_key: $project_id})
+                WHERE lineage_task.task_id IN lineage_task_ids
+                RETURN subject,
+                       affected_columns,
+                       affected_datasets,
+                       impact_tasks AS producer_tasks,
+                       collect(DISTINCT lineage_task) AS lineage_tasks,
+                       metrics
+                """,
+                params,
+            )
+        elif entity_type == "dataset":
+            rows = self.store.query(
+                """
+                MATCH (subject:Dataset {id: $id, project_key: $project_id})
+                OPTIONAL MATCH path=(subject)<-[:DATASET_DEPENDS_ON*1..50]-(down_dataset:Dataset {project_key: $project_id})
+                WHERE length(path) <= $hops
+                WITH subject, collect(DISTINCT down_dataset) AS affected_datasets
+                OPTIONAL MATCH (producer:ScheduleTask {project_key: $project_id})-[:PRODUCES]->(produced:Dataset)
+                WHERE produced IN affected_datasets
+                WITH subject, affected_datasets, collect(DISTINCT producer) AS producer_tasks
+                OPTIONAL MATCH (consumer:ScheduleTask {project_key: $project_id})-[:CONSUMES]->(consumed:Dataset)
+                WHERE consumed = subject OR consumed IN affected_datasets
+                WITH subject, affected_datasets, producer_tasks, collect(DISTINCT consumer) AS consumer_tasks
+                OPTIONAL MATCH (sql_consumer:ScheduleTask {project_key: $project_id})-[:EMITS_SQL]->(:SqlStatement)-[:READS]->(sql_consumed:Dataset)
+                WHERE sql_consumed = subject OR sql_consumed IN affected_datasets
+                WITH subject, affected_datasets, producer_tasks, consumer_tasks, collect(DISTINCT sql_consumer) AS sql_consumer_tasks
+                WITH subject, affected_datasets, producer_tasks + consumer_tasks + sql_consumer_tasks AS producer_tasks
+                OPTIONAL MATCH (metric:Metric {project_key: $project_id})-[:STORED_IN]->(metric_dataset:Dataset)
+                WHERE metric_dataset = subject OR metric_dataset IN affected_datasets
+                RETURN subject,
+                       [] AS affected_columns,
+                       affected_datasets,
+                       producer_tasks,
+                       [] AS lineage_tasks,
+                       collect(DISTINCT metric) AS metrics
+                """,
+                params,
+            )
+        elif entity_type == "schedule_task":
+            rows = self.store.query(
+                """
+                MATCH (subject:ScheduleTask {id: $id, project_key: $project_id})
+                OPTIONAL MATCH path=(subject)<-[:DEPENDS_ON*1..50]-(down_task:ScheduleTask {project_key: $project_id})
+                WHERE length(path) <= $hops
+                WITH subject, collect(DISTINCT down_task) AS affected_tasks
+                OPTIONAL MATCH (task:ScheduleTask {project_key: $project_id})-[:PRODUCES]->(dataset:Dataset)
+                WHERE task = subject OR task IN affected_tasks
+                WITH subject, affected_tasks, collect(DISTINCT dataset) AS affected_datasets
+                OPTIONAL MATCH (metric:Metric {project_key: $project_id})-[:COMPUTED_BY]->(task_for_metric:ScheduleTask)
+                WHERE task_for_metric = subject OR task_for_metric IN affected_tasks
+                RETURN subject,
+                       [] AS affected_columns,
+                       affected_datasets,
+                       affected_tasks AS producer_tasks,
+                       [] AS lineage_tasks,
+                       collect(DISTINCT metric) AS metrics
+                """,
+                params,
+            )
+        else:
+            raise ValueError(f"Impact analysis is not supported for {entity_type}")
+
+        if not rows:
+            return {
+                "summary": {
+                    "affected_column_count": 0,
+                    "affected_dataset_count": 0,
+                    "affected_task_count": 0,
+                    "affected_metric_count": 0,
+                },
+                "affected_columns": [],
+                "affected_datasets": [],
+                "affected_tasks": [],
+                "affected_metrics": [],
+            }, []
+        row = rows[0]
+        affected_columns = [item for item in row.get("affected_columns", []) if item]
+        affected_datasets = [item for item in row.get("affected_datasets", []) if item]
+        affected_tasks = [item for item in (row.get("producer_tasks", []) + row.get("lineage_tasks", [])) if item]
+        affected_metrics = [item for item in row.get("metrics", []) if item]
+        entities = []
+        for group in [affected_columns, affected_datasets, affected_tasks, affected_metrics]:
+            entities.extend(entity_ref(item, req["include_properties"]) for item in group)
+        entity_by_id = {item["entity_id"]: item for item in _dedupe_entities(entities)}
+        summary = {
+            "affected_column_count": len({item.get("id") for item in affected_columns}),
+            "affected_dataset_count": len({item.get("id") for item in affected_datasets}),
+            "affected_task_count": len({item.get("id") for item in affected_tasks}),
+            "affected_metric_count": len({item.get("id") for item in affected_metrics}),
+        }
+        offset = req["cursor_offset"]
+        limit = req["limit"]
+        data = {
+            "summary": summary,
+            "affected_columns": [entity_by_id[entity_id] for entity_id in sorted({item.get("id") for item in affected_columns if item.get("id") in entity_by_id})][offset : offset + limit],
+            "affected_datasets": [entity_by_id[entity_id] for entity_id in sorted({item.get("id") for item in affected_datasets if item.get("id") in entity_by_id})][offset : offset + limit],
+            "affected_tasks": [entity_by_id[entity_id] for entity_id in sorted({item.get("id") for item in affected_tasks if item.get("id") in entity_by_id})][offset : offset + limit],
+            "affected_metrics": [entity_by_id[entity_id] for entity_id in sorted({item.get("id") for item in affected_metrics if item.get("id") in entity_by_id})][offset : offset + limit],
+        }
+        return data, list(entity_by_id.values())
+
     def analyze_impact(self, req: dict) -> dict:
         change_type = req.get("change_type", "logic_change")
         if change_type not in CHANGE_TYPES:
@@ -598,54 +777,62 @@ class QueryService:
         node, candidates = self._resolve_subject(req, {"schedule_task", "dataset", "column"})
         if not node:
             return self._ambiguity_or_not_found("analyze_impact", candidates)
-        paths, entities, evidence = self._trace(node, "downstream", req)
-        buckets = {"must_change": set(), "likely_affected": set(), "indirectly_affected": set(), "text_match_only": set(), "unknown": set()}
-        for path in paths:
-            target_ids = path["nodes"][1:]
-            if path["hop_count"] == 1 and path["confidence"] == "high":
-                bucket = "must_change"
-            elif path["hop_count"] == 1 or path["confidence"] == "high":
-                bucket = "likely_affected"
-            else:
-                bucket = "indirectly_affected"
-            buckets[bucket].update(target_ids)
+        aggregate, aggregate_entities = self._impact_aggregate(node, req)
+        paths, path_entities, evidence = self._impact_sample_paths(node, req)
+        entities = [entity_ref(node, req["include_properties"])] + aggregate_entities + path_entities
         warns = []
         include_fallback = bool(req.get("include_sql_fallback")) or req["mode"] == "exploratory"
+        text_entities, text_evidence = [], []
         if include_fallback:
             text_entities, text_evidence = self._sql_text_matches(node, req)
-            graph_ids = {item["entity_id"] for item in entities}
-            for item in text_entities:
-                if item["entity_id"] not in graph_ids:
-                    buckets["text_match_only"].add(item["entity_id"])
             entities.extend(text_entities); evidence.extend(text_evidence)
             if text_evidence:
                 warns.append(warning("SQL_FALLBACK_ONLY", "部分结果仅来自SQL文本匹配，需要人工确认。"))
-        related_nodes = self._impact_related_entities(paths, evidence, req["project_id"])
-        related_entities = [entity_ref(item, req["include_properties"]) for item in related_nodes]
-        entities.extend(related_entities)
-        already_classified = set().union(*buckets.values())
-        for item in related_entities:
-            if item["entity_id"] not in already_classified and item["entity_id"] != node["id"]:
-                buckets["indirectly_affected"].add(item["entity_id"])
         entity_by_id = {item["entity_id"]: item for item in _dedupe_entities(entities)}
-        type_counts = {}
-        for entity_id in set().union(*buckets.values()):
-            entity_type = entity_by_id.get(entity_id, {}).get("entity_type", "unknown")
-            type_counts[entity_type] = type_counts.get(entity_type, 0) + 1
+        summary = aggregate["summary"]
+        total_affected = sum(summary.values())
+        offset = req["cursor_offset"]
+        limit = req["limit"]
+        bucket_counts = {
+            "affected_columns": summary["affected_column_count"],
+            "affected_datasets": summary["affected_dataset_count"],
+            "affected_tasks": summary["affected_task_count"],
+            "affected_metrics": summary["affected_metric_count"],
+        }
+        has_more = any(offset + limit < count for count in bucket_counts.values())
+        returned_count = sum(len(aggregate[key]) for key in bucket_counts)
         data = {
             "subject": entity_ref(node, req["include_properties"]),
             "change_type": change_type,
-            "summary": {key: len(value) for key, value in buckets.items()},
-            "entity_type_counts": type_counts,
-            **{key: [entity_by_id.get(entity_id, {"entity_id": entity_id}) for entity_id in sorted(value)] for key, value in buckets.items()},
+            **aggregate,
+            "text_match_only": text_entities[: req["limit"]],
+            "sample_path_count": len(paths),
         }
-        status = "ok" if paths else "partial"
-        if not paths:
+        status = "ok" if total_affected else "partial"
+        if total_affected and not paths:
+            warns.append(warning("SAMPLE_PATH_UNAVAILABLE", "已聚合到受影响实体，但未返回代表路径。"))
+        if not total_affected:
             warns.append(warning("LINEAGE_PARTIAL", "未找到确定性下游路径，不能据此断言没有影响。"))
-        total_affected = len(set().union(*buckets.values()))
-        if len(paths) >= req["limit"]:
-            status = "partial"; warns.append(warning("RESULT_TRUNCATED", "影响路径数量达到返回上限，当前统计不是完整范围。"))
-        return response("analyze_impact", status=status, answer=f"影响分析完成：当前识别{total_affected}个受影响实体，其中直接或高概率影响{len(buckets['must_change']) + len(buckets['likely_affected'])}个。", data=data, entities=list(entity_by_id.values()), paths=paths, evidence=evidence if req["include_evidence"] else [], warnings=warns)
+        if has_more:
+            status = "partial"; warns.append(warning("RESULT_TRUNCATED", "明细数量达到返回上限；summary 为全量计数，明细为分页样本。"))
+        answer = (
+            "影响分析完成："
+            f"受影响字段{summary['affected_column_count']}个、"
+            f"表{summary['affected_dataset_count']}张、"
+            f"任务{summary['affected_task_count']}个、"
+            f"指标{summary['affected_metric_count']}个。"
+        )
+        return response(
+            "analyze_impact",
+            status=status,
+            answer=answer,
+            data=data,
+            entities=list(entity_by_id.values()),
+            paths=paths,
+            evidence=evidence if req["include_evidence"] else [],
+            warnings=warns,
+            page={"limit": req["limit"], "returned": returned_count, "next_cursor": encode_cursor(offset + limit) if has_more else None, "has_more": has_more},
+        )
 
     def compare_metric_definitions(self, req: dict) -> dict:
         metric_result = self.get_metric_context(req)
@@ -664,24 +851,55 @@ class QueryService:
         if invalid:
             raise ValueError(f"Unsupported issue types: {sorted(invalid)}")
         comparison_types = [item for item in issue_types if item != "manual_review_required"]
+        summary_rows = self.store.query(
+            """
+            MATCH (:Metric {project_key: $project_id})-[:HAS_CODE_DEFINITION]->(:CodeDefinition)-[:HAS_COMPARISON]->(comparison:DefinitionComparison)
+            RETURN comparison.status AS status, count(*) AS count
+            ORDER BY status
+            """,
+            {"project_id": req["project_id"]},
+        )
+        issue_summary = {str(row["status"]): row["count"] for row in summary_rows}
+        selected_total = sum(issue_summary.get(item, 0) for item in comparison_types)
         rows = self.store.query(
             """
             MATCH (m:Metric {project_key: $project_id})-[:HAS_CODE_DEFINITION]->(code:CodeDefinition)-[:HAS_COMPARISON]->(comparison:DefinitionComparison)
             WHERE comparison.status IN $issue_types
+            OPTIONAL MATCH (m)-[:HAS_DEFINITION]->(registered:MetricDefinition)
             OPTIONAL MATCH (m)-[:STORED_IN]->(dataset:Dataset)
             OPTIONAL MATCH (m)-[:COMPUTED_BY]->(task:ScheduleTask)
-            RETURN m, code, comparison, collect(DISTINCT dataset) AS datasets, collect(DISTINCT task) AS tasks
+            RETURN m, code, comparison, collect(DISTINCT registered) AS registered,
+                   collect(DISTINCT dataset) AS datasets, collect(DISTINCT task) AS tasks
             ORDER BY comparison.status, m.metric_id
+            SKIP $offset
             LIMIT $limit
-            """, {"project_id": req["project_id"], "issue_types": comparison_types, "limit": req["limit"]},
+            """, {"project_id": req["project_id"], "issue_types": comparison_types, "offset": req["cursor_offset"], "limit": req["limit"]},
         )
         entities, issues = [], []
         for row in rows:
             for key in ["m", "code", "comparison"]:
                 entities.append(entity_ref(row[key], req["include_properties"]))
-            for item in row["datasets"] + row["tasks"]:
+            for item in row["registered"] + row["datasets"] + row["tasks"]:
                 if item: entities.append(entity_ref(item, req["include_properties"]))
-            issues.append({"metric_id": row["m"].get("properties", {}).get("metric_id"), "metric_name": _display_name(row["m"]), "status": row["comparison"].get("properties", {}).get("status"), "comparison_id": row["comparison"].get("id")})
+            metric_props = row["m"].get("properties", {})
+            code_props = row["code"].get("properties", {})
+            comparison_props = row["comparison"].get("properties", {})
+            issues.append({
+                "metric_id": metric_props.get("metric_id"),
+                "metric_name": _display_name(row["m"]),
+                "english_name": metric_props.get("english_name") or metric_props.get("english_name_clean"),
+                "status": comparison_props.get("status"),
+                "comparison_id": row["comparison"].get("id"),
+                "code_definition_id": row["code"].get("id"),
+                "code_summary": code_props.get("summary"),
+                "registered_definitions": [item.get("properties", {}).get("definition") for item in row["registered"] if item],
+                "conflict_points": comparison_props.get("conflict_points"),
+                "missing_in_registry": comparison_props.get("missing_in_registry"),
+                "insufficient_code_evidence": comparison_props.get("insufficient_code_evidence"),
+                "recommended_definition": comparison_props.get("recommended_definition"),
+                "storage_dataset_ids": [item.get("id") for item in row["datasets"] if item],
+                "compute_task_ids": [item.get("properties", {}).get("task_id") for item in row["tasks"] if item],
+            })
         if "manual_review_required" in issue_types and self.project_dir:
             override_path = self.project_dir / "manual_metric_overrides.json"
             overrides = json.loads(override_path.read_text()) if override_path.exists() else []
@@ -695,7 +913,19 @@ class QueryService:
                     metric = row["m"]
                     entities.append(entity_ref(metric, req["include_properties"]))
                     issues.append({"metric_id": metric.get("properties", {}).get("metric_id"), "metric_name": _display_name(metric), "status": "manual_review_required", "comparison_id": None})
-        return response("find_definition_issues", answer=f"找到{len(issues)}个口径问题。", data={"issue_types": issue_types, "issues": issues}, entities=_dedupe_entities(entities), page={"limit": req["limit"], "returned": len(issues), "next_cursor": None, "has_more": len(issues) >= req["limit"]})
+        answer_total = selected_total if comparison_types else len(issues)
+        return response(
+            "find_definition_issues",
+            answer=f"找到{answer_total}个口径问题，当前返回{len(issues)}个。",
+            data={"issue_types": issue_types, "summary": issue_summary, "selected_total": answer_total, "issues": issues},
+            entities=_dedupe_entities(entities),
+            page={
+                "limit": req["limit"],
+                "returned": len(issues),
+                "next_cursor": encode_cursor(req["cursor_offset"] + len(issues)) if req["cursor_offset"] + len(issues) < answer_total else None,
+                "has_more": req["cursor_offset"] + len(issues) < answer_total,
+            },
+        )
 
     def explain_lineage_path(self, req: dict) -> dict:
         from_id = req.get("from_entity_id")

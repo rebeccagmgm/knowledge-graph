@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import uuid
+import base64
+import json
 from datetime import datetime
 from typing import Any
 
@@ -12,6 +14,22 @@ CONFIDENCE_RANK = {"low": 1, "medium": 2, "high": 3}
 
 def request_id() -> str:
     return f"req_{uuid.uuid4().hex[:20]}"
+
+
+def encode_cursor(offset: int) -> str:
+    payload = json.dumps({"offset": max(0, int(offset))}, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor: str | None) -> int:
+    if not cursor:
+        return 0
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        return max(0, int(payload.get("offset", 0)))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("cursor is invalid") from exc
 
 
 def warning(code: str, message: str, severity: str = "warning", related_entity_ids=None) -> dict:
@@ -70,6 +88,7 @@ def validate_common(payload: dict) -> dict:
     if not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500")
     result["limit"] = limit
+    result["cursor_offset"] = decode_cursor(result.get("cursor"))
     result["include_evidence"] = bool(result.get("include_evidence", True))
     result["include_properties"] = bool(result.get("include_properties", True))
     confidence = result.get("confidence_min", "medium")
@@ -87,4 +106,3 @@ def compact_properties(properties: dict, include_properties: bool = True) -> dic
     if not include_properties:
         return {}
     return {key: value for key, value in properties.items() if value is not None}
-

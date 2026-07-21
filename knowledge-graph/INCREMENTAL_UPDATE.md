@@ -16,13 +16,14 @@
 实际登记文件默认位置：
 
 ```text
-project_registry.json
+/Applications/personal-work/kg-code-snapshots/project_registry.json
 ```
 
 ## 初始化基线
 
 ```bash
-python3 kg_probe/incremental_update.py \
+PYTHONPATH=/Applications/personal-work/kg-local-pydeps \
+python3 /Applications/personal-work/kg_probe/incremental_update.py \
   --project-id trial_project \
   --initialize
 ```
@@ -32,14 +33,16 @@ python3 kg_probe/incremental_update.py \
 扫描单个项目：
 
 ```bash
-python3 kg_probe/incremental_update.py \
+PYTHONPATH=/Applications/personal-work/kg-local-pydeps \
+python3 /Applications/personal-work/kg_probe/incremental_update.py \
   --project-id trial_project
 ```
 
 扫描登记表中的全部启用项目：
 
 ```bash
-python3 kg_probe/incremental_update.py --all
+PYTHONPATH=/Applications/personal-work/kg-local-pydeps \
+python3 /Applications/personal-work/kg_probe/incremental_update.py --all
 ```
 
 建议定时器每天调用一次`--all`。扫描器会根据各项目的`scan_interval_hours`判断是否到期，因此默认每48小时真正访问一次Horae。

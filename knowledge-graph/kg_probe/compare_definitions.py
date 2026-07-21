@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import time
@@ -161,7 +162,13 @@ def main() -> None:
                 result = post_chat_completion(args.base_url, api_key, args.model, messages, args.timeout, args.max_tokens)
                 parsed = result["parsed"]
                 raw_response = result["raw_response"]
-        except (urllib.error.URLError, json.JSONDecodeError, KeyError, TimeoutError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.IncompleteRead,
+            json.JSONDecodeError,
+            KeyError,
+            TimeoutError,
+        ) as exc:
             status = "error"
             error = str(exc)
             parsed = {}

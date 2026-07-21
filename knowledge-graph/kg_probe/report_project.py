@@ -45,6 +45,7 @@ def main() -> None:
     errors = load(base / f"{args.prefix}_sql_parse_errors.json", [])
     column_lineage = load(base / f"{args.prefix}_column_lineage.json", [])
     column_lineage_errors = load(base / f"{args.prefix}_column_lineage_errors.json", [])
+    column_lineage_skipped = load(base / f"{args.prefix}_column_lineage_skipped.json", [])
     hard_parse_errors = [item for item in errors if item.get("status") != "regex_table_facts_extracted"]
     regex_fallbacks = [item for item in errors if item.get("status") == "regex_table_facts_extracted"]
     strategy_summary = load(base / f"{args.prefix}_sql_facts_summary.json", {})
@@ -154,6 +155,7 @@ def main() -> None:
             "target_dataset_count": len({item.get("target_dataset") for item in column_lineage if item.get("target_dataset")}),
             "source_dataset_count": len({item.get("source_dataset") for item in column_lineage if item.get("source_dataset")}),
             "error_count": len(column_lineage_errors),
+            "skipped_count": len(column_lineage_skipped),
             "source_resolution_distribution": dict(
                 Counter(item.get("source_resolution", "") for item in column_lineage)
             ),
@@ -163,9 +165,13 @@ def main() -> None:
             "target_resolution_distribution": dict(
                 Counter(item.get("target_resolution", "") for item in column_lineage)
             ),
+            "output_resolution_distribution": dict(
+                Counter(item.get("output_resolution", "") for item in column_lineage if item.get("output_resolution"))
+            ),
             "error_type_distribution": dict(
                 Counter(error_bucket(item.get("error", "")) for item in column_lineage_errors)
             ),
+            "skipped_reason_distribution": dict(Counter(item.get("reason", "") for item in column_lineage_skipped)),
         },
         "graph": {
             "node_count": graph_node_count,
