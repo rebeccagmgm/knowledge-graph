@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, Query
 
 
 def to_plain(value: Any):
@@ -60,8 +59,14 @@ class Neo4jStore:
     def verify(self) -> None:
         self.driver.verify_connectivity()
 
-    def query(self, cypher: str, parameters: dict | None = None) -> list[dict]:
+    def query(
+        self,
+        cypher: str,
+        parameters: dict | None = None,
+        timeout_seconds: float | None = None,
+    ) -> list[dict]:
         with self.driver.session(database=self.database) as session:
-            result = session.run(cypher, parameters or {})
+            query = Query(cypher, timeout=timeout_seconds) if timeout_seconds is not None else cypher
+            result = session.run(query, parameters or {})
             return [{key: to_plain(value) for key, value in record.items()} for record in result]
 

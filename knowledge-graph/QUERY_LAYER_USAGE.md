@@ -60,6 +60,40 @@ python3 -m query_layer.cli explain_lineage_path --pretty --json '{
 }'
 ```
 
+## 已确认结果分支比较
+
+这里的“结果分支”是以一个已确认结果任务为入口、在指定深度内展开的关联图谱范围，
+不是 Git 分支。`compare_branches` 只比较调用方明确传入的结果分支，不发现或扩展业务范围。
+它在保留任务、数据集共同/差异/独有实体的同时，支持指标、指标定义、SQL 节点和结果字段
+分层 EntitySet，并返回局部共享组、两两相似度和有图谱证据的结果字段派生差异。
+`max_depth` 同时控制上游任务和数据集依赖深度；实际使用应显式选择深度，避免深层通用依赖
+掩盖结果附近的结构差异。
+
+服务会先按完整请求范围执行。仅当 Neo4j 返回事务内存上限错误时，才自动二分物理查询
+批次并合并原始结果；请求的结果分支范围和 `max_depth` 不会改变。恢复成功时响应保持
+`ok`，并返回 `QUERY_RECOVERED_BY_BATCH_SPLIT` 信息提示及 `data.execution` 执行元数据。
+超过十个结果分支的请求会使用最多十支的物理批次，但最终共同、差异、局部共享和两两
+比较仍在完整请求范围上统一计算。
+
+先调用 `get_graph_native_capabilities` 取得当前构建版本和已实现操作。当前只声明
+`compare_branches`；其余 graph-native 操作不会因为出现在其他契约中就被误报为可用。
+
+```bash
+python3 -m query_layer.cli compare_branches --pretty --json '{
+  "project_id": "project_sale_new",
+  "contract_version": "graph-native:v1",
+  "graph_build_id": "BUILD_ID",
+  "confirmed_branch_ids": ["task:158050", "task:220979", "task:114013"],
+  "max_depth": 2,
+  "limit": 100
+}'
+```
+
+若图中没有写入方式属性，`write_mode_by_branch` 明确返回 `UNKNOWN`，不会从任务名或表名
+推断。当前图没有 Expression 实体层时，`component_counts.expressions` 返回 `null`，并在
+`evidence_status/evidence_gaps` 中标记 `UNSUPPORTED`，不会用 0 表示“确认没有表达式”。
+未关联到指标、SQL 或结果字段也会标记为证据缺口，不能据此推断业务上不存在对应内容。
+
 请求也可通过`--file request.json`或标准输入传入。
 
 ## Python调用

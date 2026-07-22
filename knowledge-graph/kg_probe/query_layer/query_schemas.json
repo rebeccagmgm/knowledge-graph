@@ -65,6 +65,9 @@
     "analyze_impact": {"required": ["subject", "change_type"]},
     "compare_metric_definitions": {"requiredAny": ["metric_id", "entity_id", "subject"]},
     "find_definition_issues": {"required": ["issue_types"]},
-    "explain_lineage_path": {"required": ["from_entity_id", "to_entity_id"]}
+    "explain_lineage_path": {"required": ["from_entity_id", "to_entity_id"]},
+    "compare_branches": {
+      "required": ["contract_version", "graph_build_id", "confirmed_branch_ids"]
+    }
   }
 }

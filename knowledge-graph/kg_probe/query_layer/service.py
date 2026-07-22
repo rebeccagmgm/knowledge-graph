@@ -6,7 +6,15 @@ import re
 import time
 from pathlib import Path
 
-from .contracts import CONFIDENCE_RANK, compact_properties, encode_cursor, response, validate_common, warning
+from .contracts import (
+    CONFIDENCE_RANK,
+    compact_properties,
+    encode_cursor,
+    request_id,
+    response,
+    validate_common,
+    warning,
+)
 
 
 TYPE_TO_LABEL = {
@@ -36,6 +44,10 @@ TRACE_RELATIONS = {
     "column": "DERIVED_FROM",
     "metric": "STORED_IN|COMPUTED_BY|DATASET_DEPENDS_ON|DEPENDS_ON",
 }
+
+COMPARE_BRANCH_BATCH_SIZE = 10
+COMPARE_MEMORY_ERROR_CODE = "Neo.TransientError.General.MemoryPoolOutOfMemoryError"
+COMPARE_QUERY_TIMEOUT_SECONDS = 30.0
 
 CHANGE_TYPES = {"drop", "rename", "type_change", "logic_change", "stop_production", "schedule_change"}
 ISSUE_TYPES = {"conflict", "partially_consistent", "code_evidence_insufficient", "registry_missing", "manual_review_required", "consistent"}
@@ -103,7 +115,7 @@ class QueryService:
         "search_entities", "resolve_entity", "get_metric_context", "get_task_context",
         "get_dataset_context", "get_column_context", "trace_upstream", "trace_downstream",
         "analyze_impact", "compare_metric_definitions", "find_definition_issues",
-        "explain_lineage_path",
+        "explain_lineage_path", "compare_branches",
     }
 
     def __init__(self, store, project_id: str = "trial_project", project_dir: str | Path | None = None):
@@ -123,6 +135,8 @@ class QueryService:
             result = response(primitive, status="error", answer=str(exc), warnings=[warning("INVALID_REQUEST", str(exc), "error")])
         except Exception as exc:  # noqa: BLE001
             result = response(primitive, status="error", answer="查询执行失败。", warnings=[warning("QUERY_EXECUTION_FAILED", str(exc), "error")])
+        if "diagnostics" not in result:
+            return result
         result["diagnostics"].setdefault("elapsed_ms", round((time.perf_counter() - started) * 1000, 2))
         result["diagnostics"].setdefault("query_primitive", primitive)
         if not result.get("graph_context"):
@@ -165,6 +179,726 @@ class QueryService:
                 context["last_scan_at"] = state.get("last_scan_at")
                 context["has_pending_change"] = bool(state.get("last_semantic_change"))
         return context
+
+    def get_graph_native_capabilities(self, project_id: str | None = None) -> dict:
+        context = self.get_graph_status(project_id)
+        return {
+            "provider_id": "graph-query-provider",
+            "contract_version": "graph-native:v1",
+            "supported_primitives": ["compare_branches"],
+            "primitive_capabilities": {
+                "compare_branches": {
+                    "entity_layers": [
+                        "schedule_task", "dataset", "metric", "metric_definition",
+                        "sql_statement", "result_column",
+                    ],
+                    "derived_comparisons": [
+                        "partial_sharing", "pairwise_similarity",
+                        "result_column_derivation_differences",
+                    ],
+                    "unsupported_entity_layers": ["expression"],
+                    "execution_recovery": ["adaptive_branch_bisection"],
+                },
+            },
+            "graph_context": {
+                "project_id": context["project_id"],
+                "build_id": context.get("build_id"),
+                "built_at": context.get("built_at"),
+                "is_latest": bool(context.get("is_latest")),
+                "has_pending_change": bool(context.get("has_pending_change")),
+            },
+        }
+
+    @staticmethod
+    def _validate_compare_branches_request(req: dict) -> list[str]:
+        if req.get("contract_version") != "graph-native:v1":
+            raise ValueError("contract_version must be graph-native:v1")
+        graph_build_id = req.get("graph_build_id")
+        if not isinstance(graph_build_id, str) or not graph_build_id:
+            raise ValueError("graph_build_id is required")
+        branch_ids = req.get("confirmed_branch_ids")
+        if not isinstance(branch_ids, list) or len(branch_ids) < 2:
+            raise ValueError("confirmed_branch_ids must contain at least two branches")
+        if len(branch_ids) > 100 or len(set(branch_ids)) != len(branch_ids):
+            raise ValueError("confirmed_branch_ids must contain 2 to 100 unique branches")
+        if any(not isinstance(branch_id, str) or not re.fullmatch(r"task:[^\s]+", branch_id) for branch_id in branch_ids):
+            raise ValueError("confirmed_branch_ids must contain task entity ids")
+        if req["limit"] > 100:
+            raise ValueError("limit must be between 1 and 100 for graph-native requests")
+        return branch_ids
+
+    @staticmethod
+    def _compare_shared_groups(
+        branch_ids: list[str],
+        entity_sets_by_branch: dict[str, dict[str, set[str]]],
+        limit: int,
+    ) -> tuple[list[dict], int]:
+        memberships: dict[str, dict[str, set[str]]] = {}
+        for branch_id, typed_sets in entity_sets_by_branch.items():
+            for entity_type, entity_ids in typed_sets.items():
+                for entity_id in entity_ids:
+                    memberships.setdefault(entity_id, {
+                        "entity_type": entity_type,
+                        "branch_ids": set(),
+                    })["branch_ids"].add(branch_id)
+
+        grouped: dict[tuple[str, ...], dict[str, list[str]]] = {}
+        for entity_id, membership in memberships.items():
+            member_ids = tuple(
+                branch_id for branch_id in branch_ids
+                if branch_id in membership["branch_ids"]
+            )
+            if not 2 <= len(member_ids) < len(branch_ids):
+                continue
+            grouped.setdefault(member_ids, {}).setdefault(
+                str(membership["entity_type"]), []
+            ).append(entity_id)
+
+        groups = []
+        for member_ids, typed_ids in grouped.items():
+            sorted_typed_ids = {
+                entity_type: sorted(entity_ids)
+                for entity_type, entity_ids in sorted(typed_ids.items())
+            }
+            groups.append({
+                "branch_ids": list(member_ids),
+                "shared_branch_count": len(member_ids),
+                "entity_count": sum(len(entity_ids) for entity_ids in sorted_typed_ids.values()),
+                "entity_counts_by_type": {
+                    entity_type: len(entity_ids)
+                    for entity_type, entity_ids in sorted_typed_ids.items()
+                },
+                "entity_ids_by_type": sorted_typed_ids,
+                "evidence_status": "CONFIRMED",
+            })
+        groups.sort(key=lambda item: (
+            -item["shared_branch_count"],
+            -item["entity_count"],
+            item["branch_ids"],
+        ))
+        return groups[:limit], max(0, len(groups) - limit)
+
+    @staticmethod
+    def _compare_pairwise(
+        branch_ids: list[str],
+        entity_sets_by_branch: dict[str, dict[str, set[str]]],
+        limit: int,
+    ) -> tuple[list[dict], int]:
+        comparisons = []
+        for left_index, left_id in enumerate(branch_ids):
+            for right_id in branch_ids[left_index + 1:]:
+                left_sets = entity_sets_by_branch[left_id]
+                right_sets = entity_sets_by_branch[right_id]
+                entity_types = sorted(set(left_sets) | set(right_sets))
+                shared_by_type = {}
+                union_by_type = {}
+                left_all: set[str] = set()
+                right_all: set[str] = set()
+                for entity_type in entity_types:
+                    left_values = left_sets.get(entity_type, set())
+                    right_values = right_sets.get(entity_type, set())
+                    shared_by_type[entity_type] = len(left_values & right_values)
+                    union_by_type[entity_type] = len(left_values | right_values)
+                    left_all.update(left_values)
+                    right_all.update(right_values)
+                union = left_all | right_all
+                shared = left_all & right_all
+                comparisons.append({
+                    "branch_ids": [left_id, right_id],
+                    "shared_entity_count": len(shared),
+                    "union_entity_count": len(union),
+                    "jaccard_similarity": round(len(shared) / len(union), 6) if union else None,
+                    "shared_counts_by_type": shared_by_type,
+                    "union_counts_by_type": union_by_type,
+                    "evidence_status": "DERIVED_FROM_CONFIRMED_ENTITIES",
+                })
+        comparisons.sort(key=lambda item: (
+            -(item["jaccard_similarity"] or 0),
+            item["branch_ids"],
+        ))
+        return comparisons[:limit], max(0, len(comparisons) - limit)
+
+    @staticmethod
+    def _compare_column_derivations(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+        by_column: dict[str, dict[str, set[str]]] = {}
+        column_ids_by_branch: dict[str, set[str]] = {}
+        for row in rows:
+            branch_id = row.get("branch_id")
+            column_id = row.get("column_id")
+            column_key = row.get("column_key") or column_id
+            if not branch_id or not column_id or not column_key:
+                continue
+            column_ids_by_branch.setdefault(branch_id, set()).add(column_id)
+            by_column.setdefault(str(column_key), {}).setdefault(branch_id, set()).update(
+                source_id for source_id in row.get("source_column_ids", []) if source_id
+            )
+
+        differences = []
+        incomplete = []
+        for column_key, sources_by_branch in sorted(by_column.items()):
+            if len(sources_by_branch) < 2:
+                continue
+            missing_branches = sorted(
+                branch_id for branch_id, source_ids in sources_by_branch.items()
+                if not source_ids
+            )
+            if missing_branches:
+                incomplete.append({
+                    "column_key": column_key,
+                    "branch_ids": sorted(sources_by_branch),
+                    "missing_derivation_branch_ids": missing_branches,
+                    "evidence_status": "MISSING",
+                })
+                continue
+            normalized = {tuple(sorted(source_ids)) for source_ids in sources_by_branch.values()}
+            if len(normalized) > 1:
+                differences.append({
+                    "column_key": column_key,
+                    "evidence_status": "CONFIRMED",
+                    "derivations_by_branch": {
+                        branch_id: sorted(source_ids)
+                        for branch_id, source_ids in sorted(sources_by_branch.items())
+                    },
+                })
+        return differences, incomplete
+
+    def _query_compare_branch_scope_once(
+        self,
+        branch_ids: list[str],
+        project_id: str,
+        max_depth: int,
+    ) -> list[dict]:
+        return self.store.query(
+            f"""
+            /* compare_branches:scope */
+            UNWIND $branch_entity_ids AS branch_id
+            MATCH (branch:ScheduleTask {{id: branch_id, project_key: $project_id}})
+            OPTIONAL MATCH task_path=(branch)-[:DEPENDS_ON*0..{max_depth}]->(
+                task:ScheduleTask {{project_key: $project_id}}
+            )
+            WITH branch_id, branch, collect(DISTINCT task) AS tasks,
+                 collect(DISTINCT task_path) AS task_paths
+            UNWIND tasks AS task
+            OPTIONAL MATCH (task)-[emits_rel:EMITS_SQL]->(:SqlStatement)-[read_rel:READS]->(
+                consumed:Dataset {{project_key: $project_id}}
+            )
+            OPTIONAL MATCH (task)-[produced_rel:PRODUCES]->(
+                produced:Dataset {{project_key: $project_id}}
+            )
+            WITH branch_id, branch, tasks, task_paths,
+                 collect(DISTINCT task.id) AS task_ids,
+                 collect(DISTINCT consumed) AS consumed_datasets,
+                 collect(DISTINCT produced) AS produced_datasets,
+                 collect(DISTINCT emits_rel) AS emits_rels,
+                 collect(DISTINCT read_rel) AS read_rels,
+                 collect(DISTINCT produced_rel) AS produced_rels
+            OPTIONAL MATCH (branch)-[:PRODUCES]->(
+                result_dataset:Dataset {{project_key: $project_id}}
+            )
+            WITH branch_id, branch, task_ids, task_paths, consumed_datasets,
+                 produced_datasets, emits_rels, read_rels, produced_rels,
+                 collect(DISTINCT result_dataset) AS result_datasets
+            WITH branch_id, branch, task_ids, task_paths, consumed_datasets,
+                 produced_datasets, emits_rels, read_rels, produced_rels, result_datasets,
+                 [dataset IN result_datasets | dataset.id] AS result_dataset_ids,
+                 consumed_datasets + CASE
+                     WHEN size(result_datasets) > 0 THEN result_datasets
+                     ELSE produced_datasets
+                 END AS lineage_roots
+            UNWIND CASE WHEN size(lineage_roots) = 0 THEN [null] ELSE lineage_roots END AS direct_dataset
+            OPTIONAL MATCH dataset_path=(direct_dataset)-[:DATASET_DEPENDS_ON*0..{max_depth}]->(
+                lineage_dataset:Dataset {{project_key: $project_id}}
+            )
+            WITH branch_id, branch, task_ids, task_paths, consumed_datasets,
+                 produced_datasets, emits_rels, read_rels, produced_rels, result_dataset_ids,
+                 collect(DISTINCT lineage_dataset.id) AS lineage_dataset_ids,
+                 collect(DISTINCT dataset_path) AS dataset_paths
+            RETURN branch_id, task_ids,
+                   [dataset IN consumed_datasets WHERE dataset IS NOT NULL | dataset.id] AS consumed_dataset_ids,
+                   [dataset IN produced_datasets WHERE dataset IS NOT NULL | dataset.id] AS produced_dataset_ids,
+                   lineage_dataset_ids, result_dataset_ids,
+                   reduce(rel_ids = [], path IN task_paths + dataset_paths |
+                       rel_ids + [rel IN relationships(path) |
+                           coalesce(toString(rel.id), elementId(rel))])
+                   + [rel IN emits_rels + read_rels + produced_rels WHERE rel IS NOT NULL |
+                       coalesce(toString(rel.id), elementId(rel))] AS relationship_ids,
+                   properties(branch) AS branch_properties
+            ORDER BY branch_id
+            """,
+            {"branch_entity_ids": branch_ids, "project_id": project_id},
+            timeout_seconds=COMPARE_QUERY_TIMEOUT_SECONDS,
+        )
+
+    def _query_compare_branch_scope_adaptive(
+        self,
+        branch_ids: list[str],
+        project_id: str,
+        max_depth: int,
+        execution: dict,
+    ) -> list[dict]:
+        execution["attempted_batch_sizes"].append(len(branch_ids))
+        try:
+            return self._query_compare_branch_scope_once(
+                branch_ids,
+                project_id,
+                max_depth,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error_code = getattr(exc, "code", None)
+            if error_code != COMPARE_MEMORY_ERROR_CODE or len(branch_ids) <= 1:
+                raise
+            execution["memory_recovery_count"] += 1
+            if error_code not in execution["recovered_error_codes"]:
+                execution["recovered_error_codes"].append(error_code)
+            midpoint = len(branch_ids) // 2
+            left_rows = self._query_compare_branch_scope_adaptive(
+                branch_ids[:midpoint],
+                project_id,
+                max_depth,
+                execution,
+            )
+            right_rows = self._query_compare_branch_scope_adaptive(
+                branch_ids[midpoint:],
+                project_id,
+                max_depth,
+                execution,
+            )
+            return left_rows + right_rows
+
+    def _query_compare_branch_scopes(
+        self,
+        branch_ids: list[str],
+        project_id: str,
+        max_depth: int,
+    ) -> tuple[list[dict], dict]:
+        execution = {
+            "strategy": "single_query",
+            "requested_branch_count": len(branch_ids),
+            "requested_max_depth": max_depth,
+            "applied_max_depth": max_depth,
+            "attempted_batch_sizes": [],
+            "attempt_count": 0,
+            "memory_recovery_count": 0,
+            "recovered_error_codes": [],
+            "semantic_scope_preserved": True,
+        }
+        rows = []
+        initial_batches = [
+            branch_ids[index:index + COMPARE_BRANCH_BATCH_SIZE]
+            for index in range(0, len(branch_ids), COMPARE_BRANCH_BATCH_SIZE)
+        ]
+        for batch in initial_batches:
+            rows.extend(self._query_compare_branch_scope_adaptive(
+                batch,
+                project_id,
+                max_depth,
+                execution,
+            ))
+        execution["attempt_count"] = len(execution["attempted_batch_sizes"])
+        if execution["memory_recovery_count"]:
+            execution["strategy"] = "adaptive_bisection"
+        elif len(initial_batches) > 1:
+            execution["strategy"] = "bounded_batches"
+        return rows, execution
+
+    def compare_branches(self, req: dict) -> dict:
+        branch_ids = self._validate_compare_branches_request(req)
+        project_id = req.get("project_id", self.project_id)
+        max_depth = int(req.get("max_depth", req["max_hops"]))
+        if not 1 <= max_depth <= 20:
+            raise ValueError("max_depth must be between 1 and 20")
+        graph_context = self.get_graph_status(project_id)
+        if graph_context.get("build_id") != req["graph_build_id"]:
+            raise ValueError("graph_build_id does not match the current graph build")
+
+        rows, execution = self._query_compare_branch_scopes(
+            branch_ids,
+            project_id,
+            max_depth,
+        )
+
+        row_by_branch = {row["branch_id"]: row for row in rows}
+        legacy_entity_sets = []
+        task_sets_by_branch: dict[str, set[str]] = {}
+        dataset_sets_by_branch: dict[str, set[str]] = {}
+        result_dataset_ids_by_branch: dict[str, set[str]] = {}
+        all_task_ids: set[str] = set()
+        all_dataset_ids: set[str] = set()
+        all_relationship_ids: set[str] = set()
+        write_modes = {}
+        unresolved = []
+        valid_write_modes = {"APPEND", "OVERWRITE", "MERGE"}
+        for branch_id in branch_ids:
+            row = row_by_branch.get(branch_id)
+            if row is None:
+                unresolved.append(f"unresolved:{branch_id}")
+                legacy_entity_sets.append(set())
+                task_sets_by_branch[branch_id] = set()
+                dataset_sets_by_branch[branch_id] = set()
+                result_dataset_ids_by_branch[branch_id] = set()
+                write_modes[branch_id] = "UNKNOWN"
+                continue
+            task_ids = {value for value in row.get("task_ids", []) if value}
+            consumed_ids = {value for value in row.get("consumed_dataset_ids", []) if value}
+            produced_ids = {value for value in row.get("produced_dataset_ids", []) if value}
+            lineage_ids = {value for value in row.get("lineage_dataset_ids", []) if value}
+            dataset_ids = consumed_ids | produced_ids | lineage_ids
+            legacy_entity_sets.append(task_ids | dataset_ids)
+            task_sets_by_branch[branch_id] = task_ids
+            dataset_sets_by_branch[branch_id] = dataset_ids
+            result_dataset_ids_by_branch[branch_id] = {
+                value for value in row.get("result_dataset_ids", []) if value
+            }
+            all_task_ids.update(task_ids)
+            all_dataset_ids.update(dataset_ids)
+            all_relationship_ids.update(
+                value for value in row.get("relationship_ids", []) if value
+            )
+            write_mode = str(
+                row.get("write_mode")
+                or row.get("branch_properties", {}).get("write_mode")
+                or "UNKNOWN"
+            ).upper()
+            write_modes[branch_id] = write_mode if write_mode in valid_write_modes else "UNKNOWN"
+
+        metric_rows = self.store.query(
+            """
+            /* compare_branches:metrics */
+            MATCH (metric:Metric {project_key: $project_id})
+            OPTIONAL MATCH (metric)-[:STORED_IN]->(storage:Dataset)
+            OPTIONAL MATCH (metric)-[:COMPUTED_BY]->(compute_task:ScheduleTask)
+            OPTIONAL MATCH (metric)-[:HAS_DEFINITION]->(definition:MetricDefinition)
+            WITH metric, collect(DISTINCT storage.id) AS storage_dataset_ids,
+                 collect(DISTINCT compute_task.id) AS compute_task_ids,
+                 collect(DISTINCT definition.id) AS definition_ids
+            WHERE any(dataset_id IN storage_dataset_ids WHERE dataset_id IN $dataset_ids)
+               OR any(task_id IN compute_task_ids WHERE task_id IN $task_ids)
+            RETURN metric.id AS metric_id, storage_dataset_ids, compute_task_ids,
+                   definition_ids
+            ORDER BY metric_id
+            """,
+            {
+                "project_id": project_id,
+                "dataset_ids": sorted(all_dataset_ids),
+                "task_ids": sorted(all_task_ids),
+            },
+            timeout_seconds=COMPARE_QUERY_TIMEOUT_SECONDS,
+        )
+        sql_rows = self.store.query(
+            """
+            /* compare_branches:sql */
+            MATCH (task:ScheduleTask {project_key: $project_id})-[:EMITS_SQL]->(
+                sql:SqlStatement {project_key: $project_id}
+            )
+            WHERE task.id IN $task_ids
+            RETURN task.id AS task_id, collect(DISTINCT sql.id) AS sql_ids
+            ORDER BY task_id
+            """,
+            {"project_id": project_id, "task_ids": sorted(all_task_ids)},
+            timeout_seconds=COMPARE_QUERY_TIMEOUT_SECONDS,
+        )
+        column_rows = self.store.query(
+            """
+            /* compare_branches:columns */
+            MATCH (dataset:Dataset {project_key: $project_id})-[:HAS_COLUMN]->(
+                column:Column {project_key: $project_id}
+            )
+            WHERE dataset.id IN $dataset_ids
+            RETURN dataset.id AS dataset_id, collect(DISTINCT column.id) AS column_ids
+            ORDER BY dataset_id
+            """,
+            {"project_id": project_id, "dataset_ids": sorted(all_dataset_ids)},
+            timeout_seconds=COMPARE_QUERY_TIMEOUT_SECONDS,
+        )
+        result_column_rows = self.store.query(
+            """
+            /* compare_branches:result_columns */
+            UNWIND $branch_results AS branch_result
+            UNWIND branch_result.result_dataset_ids AS result_dataset_id
+            MATCH (result_dataset:Dataset {
+                id: result_dataset_id, project_key: $project_id
+            })-[:HAS_COLUMN]->(column:Column {project_key: $project_id})
+            OPTIONAL MATCH (column)-[:DERIVED_FROM]->(
+                source:Column {project_key: $project_id}
+            )
+            RETURN branch_result.branch_id AS branch_id,
+                   result_dataset_id AS result_dataset_id,
+                   column.id AS column_id,
+                   coalesce(column.name, column.id) AS column_key,
+                   collect(DISTINCT source.id) AS source_column_ids
+            ORDER BY branch_id, result_dataset_id, column_key
+            """,
+            {
+                "project_id": project_id,
+                "branch_results": [
+                    {
+                        "branch_id": branch_id,
+                        "result_dataset_ids": sorted(result_dataset_ids_by_branch[branch_id]),
+                    }
+                    for branch_id in branch_ids
+                ],
+            },
+            timeout_seconds=COMPARE_QUERY_TIMEOUT_SECONDS,
+        )
+
+        metrics_by_branch = {branch_id: set() for branch_id in branch_ids}
+        definitions_by_branch = {branch_id: set() for branch_id in branch_ids}
+        for row in metric_rows:
+            metric_id = row.get("metric_id")
+            if not metric_id:
+                continue
+            storage_ids = {value for value in row.get("storage_dataset_ids", []) if value}
+            compute_ids = {value for value in row.get("compute_task_ids", []) if value}
+            definition_ids = {value for value in row.get("definition_ids", []) if value}
+            for branch_id in branch_ids:
+                if (
+                    storage_ids & dataset_sets_by_branch[branch_id]
+                    or compute_ids & task_sets_by_branch[branch_id]
+                ):
+                    metrics_by_branch[branch_id].add(metric_id)
+                    definitions_by_branch[branch_id].update(definition_ids)
+
+        sql_by_task = {
+            row.get("task_id"): {value for value in row.get("sql_ids", []) if value}
+            for row in sql_rows if row.get("task_id")
+        }
+        sql_by_branch = {
+            branch_id: set().union(*(
+                sql_by_task.get(task_id, set())
+                for task_id in task_sets_by_branch[branch_id]
+            )) if task_sets_by_branch[branch_id] else set()
+            for branch_id in branch_ids
+        }
+        columns_by_dataset = {
+            row.get("dataset_id"): {value for value in row.get("column_ids", []) if value}
+            for row in column_rows if row.get("dataset_id")
+        }
+        scoped_columns_by_branch = {
+            branch_id: set().union(*(
+                columns_by_dataset.get(dataset_id, set())
+                for dataset_id in dataset_sets_by_branch[branch_id]
+            )) if dataset_sets_by_branch[branch_id] else set()
+            for branch_id in branch_ids
+        }
+        result_columns_by_branch = {branch_id: set() for branch_id in branch_ids}
+        for row in result_column_rows:
+            if row.get("branch_id") in result_columns_by_branch and row.get("column_id"):
+                result_columns_by_branch[row["branch_id"]].add(row["column_id"])
+
+        entity_sets_by_branch = {
+            branch_id: {
+                "schedule_task": task_sets_by_branch[branch_id],
+                "dataset": dataset_sets_by_branch[branch_id],
+                "metric": metrics_by_branch[branch_id],
+                "metric_definition": definitions_by_branch[branch_id],
+                "sql_statement": sql_by_branch[branch_id],
+                "result_column": result_columns_by_branch[branch_id],
+            }
+            for branch_id in branch_ids
+        }
+        common_ids = set.intersection(*legacy_entity_sets) if legacy_entity_sets else set()
+        divergence_ids = (all_task_ids | all_dataset_ids) - common_ids
+        unique_by_branch = {}
+        for index, branch_id in enumerate(branch_ids):
+            other_ids = set().union(
+                *(entity_set for other_index, entity_set in enumerate(legacy_entity_sets)
+                  if other_index != index)
+            )
+            unique_by_branch[branch_id] = sorted(legacy_entity_sets[index] - other_ids)
+
+        unique_by_branch_by_type = {}
+        common_by_type = {}
+        divergence_by_type = {}
+        comparison_entity_types = sorted(next(iter(entity_sets_by_branch.values())))
+        for entity_type in comparison_entity_types:
+            typed_sets = [
+                entity_sets_by_branch[branch_id][entity_type]
+                for branch_id in branch_ids
+            ]
+            typed_common = set.intersection(*typed_sets) if typed_sets else set()
+            common_by_type[entity_type] = sorted(typed_common)
+            divergence_by_type[entity_type] = sorted(set().union(*typed_sets) - typed_common)
+        for branch_id in branch_ids:
+            unique_by_branch_by_type[branch_id] = {}
+            for entity_type, entity_ids in entity_sets_by_branch[branch_id].items():
+                other_ids = set().union(*(
+                    entity_sets_by_branch[other_id].get(entity_type, set())
+                    for other_id in branch_ids if other_id != branch_id
+                ))
+                unique_by_branch_by_type[branch_id][entity_type] = sorted(entity_ids - other_ids)
+
+        limit = req["limit"]
+        shared_groups, omitted_shared_group_count = self._compare_shared_groups(
+            branch_ids, entity_sets_by_branch, limit
+        )
+        pairwise_comparisons, omitted_pairwise_count = self._compare_pairwise(
+            branch_ids, entity_sets_by_branch, limit
+        )
+        column_differences, incomplete_column_derivations = self._compare_column_derivations(
+            result_column_rows
+        )
+        truncated = bool(omitted_shared_group_count or omitted_pairwise_count)
+        warnings = []
+        if unresolved:
+            warnings.append(
+                warning(
+                    "LINEAGE_PARTIAL",
+                    "One or more confirmed branches could not be resolved in the selected graph build.",
+                    related_entity_ids=[item.removeprefix("unresolved:") for item in unresolved],
+                )
+            )
+        if truncated:
+            warnings.append(warning(
+                "RESULT_TRUNCATED",
+                "Some shared-group or pairwise detail rows were omitted; aggregate counts still cover the full branch scope.",
+            ))
+        if execution["memory_recovery_count"]:
+            warnings.append(warning(
+                "QUERY_RECOVERED_BY_BATCH_SPLIT",
+                "The requested branch scope was preserved after recovering from transaction memory pressure by splitting physical query batches.",
+                severity="info",
+                related_entity_ids=branch_ids,
+            ))
+
+        status = "partial" if truncated or unresolved else "ok"
+        all_metric_ids = set().union(*metrics_by_branch.values()) if metrics_by_branch else set()
+        all_definition_ids = set().union(*definitions_by_branch.values()) if definitions_by_branch else set()
+        all_sql_ids = set().union(*sql_by_branch.values()) if sql_by_branch else set()
+        all_column_ids = set().union(*scoped_columns_by_branch.values()) if scoped_columns_by_branch else set()
+        counts = {
+            "tasks": len(all_task_ids),
+            "tables": len(all_dataset_ids),
+            "columns": len(all_column_ids),
+            "expressions": None,
+            "datasets": len(all_dataset_ids),
+            "metrics": len(all_metric_ids),
+            "metric_definitions": len(all_definition_ids),
+            "sql_statements": len(all_sql_ids),
+            "result_columns": len(set().union(*result_columns_by_branch.values())),
+            "result_branches": len(row_by_branch),
+        }
+        stable_context = {
+            "project_id": project_id,
+            "build_id": graph_context["build_id"],
+            "built_at": graph_context.get("built_at"),
+            "is_latest": bool(graph_context.get("is_latest")),
+            "has_pending_change": bool(graph_context.get("has_pending_change")),
+        }
+        return {
+            "request_id": request_id(),
+            "primitive": "compare_branches",
+            "status": status,
+            "data": {
+                "aggregation_stage": "before_pagination",
+                "scope_branch_ids": branch_ids,
+                "execution": execution,
+                "component_counts": counts,
+                "coverage": {
+                    "nodes_considered": sum(
+                        value for key, value in counts.items()
+                        if key not in {"tables", "expressions", "result_branches"}
+                        and key != "result_columns"
+                        and isinstance(value, int)
+                    ),
+                    "relationships_considered": len(all_relationship_ids),
+                    "permission_filtered": False,
+                    "unresolved_segments": len(unresolved),
+                },
+                "truncated": truncated,
+                "results": [{
+                    "branch_ids": branch_ids,
+                    "common_entity_ids": sorted(common_ids),
+                    "divergence_entity_ids": sorted(divergence_ids),
+                    "unique_entity_ids_by_branch": unique_by_branch,
+                    "entity_sets_by_branch": {
+                        branch_id: {
+                            entity_type: sorted(entity_ids)
+                            for entity_type, entity_ids in typed_sets.items()
+                        }
+                        for branch_id, typed_sets in entity_sets_by_branch.items()
+                    },
+                    "common_entity_ids_by_type": common_by_type,
+                    "divergence_entity_ids_by_type": divergence_by_type,
+                    "unique_entity_ids_by_branch_by_type": unique_by_branch_by_type,
+                    "partially_shared_entity_groups": shared_groups,
+                    "omitted_shared_group_count": omitted_shared_group_count,
+                    "pairwise_comparisons": pairwise_comparisons,
+                    "omitted_pairwise_comparison_count": omitted_pairwise_count,
+                    "write_mode_by_branch": write_modes,
+                    "column_derivation_differences": column_differences,
+                    "incomplete_column_derivations": incomplete_column_derivations,
+                    "evidence_status": {
+                        "entity_layers": {
+                            "schedule_task": "CONFIRMED",
+                            "dataset": "CONFIRMED",
+                            "metric": "CONFIRMED",
+                            "metric_definition": "CONFIRMED",
+                            "sql_statement": "CONFIRMED",
+                            "result_column": "CONFIRMED",
+                        },
+                        "tables": "DATASET_NODE_PROXY",
+                        "expressions": "UNSUPPORTED",
+                        "write_mode_by_branch": {
+                            branch_id: "CONFIRMED" if write_mode != "UNKNOWN" else "MISSING"
+                            for branch_id, write_mode in write_modes.items()
+                        },
+                        "pairwise_comparisons": "DERIVED_FROM_CONFIRMED_ENTITIES",
+                    },
+                    "evidence_gaps": [
+                        {
+                            "code": "WRITE_MODE_MISSING",
+                            "branch_id": branch_id,
+                            "evidence_status": "MISSING",
+                            "meaning": "No supported write-mode property was found; UNKNOWN is not a business conclusion.",
+                        }
+                        for branch_id, write_mode in write_modes.items()
+                        if write_mode == "UNKNOWN"
+                    ] + [
+                        {
+                            "code": "REGISTERED_METRIC_LINK_NOT_FOUND",
+                            "branch_id": branch_id,
+                            "evidence_status": "MISSING",
+                            "meaning": "No linked Metric node was found in this branch scope; this does not prove the report has no business indicators.",
+                        }
+                        for branch_id in branch_ids
+                        if not metrics_by_branch[branch_id]
+                    ] + [
+                        {
+                            "code": "SQL_STATEMENT_LINK_NOT_FOUND",
+                            "branch_id": branch_id,
+                            "evidence_status": "MISSING",
+                            "meaning": "No linked SqlStatement node was found in this branch scope.",
+                        }
+                        for branch_id in branch_ids
+                        if not sql_by_branch[branch_id]
+                    ] + [
+                        {
+                            "code": "RESULT_COLUMN_LINK_NOT_FOUND",
+                            "branch_id": branch_id,
+                            "evidence_status": "MISSING",
+                            "meaning": "The branch has a result dataset but no linked result-column nodes were found.",
+                        }
+                        for branch_id in branch_ids
+                        if result_dataset_ids_by_branch[branch_id]
+                        and not result_columns_by_branch[branch_id]
+                    ] + ([{
+                        "code": "EXPRESSION_ENTITY_UNSUPPORTED",
+                        "evidence_status": "UNSUPPORTED",
+                        "meaning": "The current graph/query contract has no Expression entity layer.",
+                    }] if counts["expressions"] is None else []),
+                    "unresolved_segment_ids": unresolved,
+                }],
+            },
+            "warnings": warnings,
+            "graph_context": stable_context,
+            "page": {
+                "limit": limit,
+                "returned": 1,
+                "next_cursor": None,
+                "has_more": truncated,
+            },
+        }
+
 
     def _search(self, query: str, entity_types: list[str], project_id: str, limit: int) -> list[dict]:
         labels = []

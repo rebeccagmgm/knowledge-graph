@@ -51,6 +51,8 @@ def main() -> None:
         service = QueryService(store, args.project_id, args.project_dir)
         if args.primitive == "get_graph_status":
             result = service.get_graph_status(args.project_id)
+        elif args.primitive == "get_graph_native_capabilities":
+            result = service.get_graph_native_capabilities(args.project_id)
         else:
             result = service.execute(args.primitive, payload)
         print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
