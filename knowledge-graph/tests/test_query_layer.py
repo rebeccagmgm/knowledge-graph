@@ -148,6 +148,50 @@ class AdaptiveCompareBranchesStore:
         return [{"p": project, "latest": project}]
 
 
+class StructuralCompareBranchesStore(AdaptiveCompareBranchesStore):
+    def __init__(self, topology_error=None, unresolved_branch_id=None):
+        super().__init__()
+        self.topology_error = topology_error
+        self.unresolved_branch_id = unresolved_branch_id
+
+    def query(self, cypher, parameters=None, timeout_seconds=None):
+        parameters = parameters or {}
+        if "compare_branches:structural_topology" in cypher:
+            self.calls.append((cypher, parameters, timeout_seconds))
+            if self.topology_error:
+                raise self.topology_error
+            return [
+                {
+                    "relationship_id": "edge:shared",
+                    "relationship_type": "DEPENDS_ON",
+                    "from_entity_id": "dataset:shared-one",
+                    "to_entity_id": "dataset:shared-two",
+                    "observed_branch_ids": ["task:0", "task:1"],
+                }
+            ]
+        if "compare_branches:scope" in cypher:
+            rows = super().query(cypher, parameters, timeout_seconds)
+            result = []
+            for row in rows:
+                if row["branch_id"] == self.unresolved_branch_id:
+                    continue
+                if row["branch_id"] in {"task:0", "task:1"}:
+                    row = {
+                        **row,
+                        "consumed_dataset_ids": [
+                            "dataset:shared-one", "dataset:shared-two",
+                        ],
+                        "lineage_dataset_ids": [
+                            row["lineage_dataset_ids"][0],
+                            "dataset:shared-one",
+                            "dataset:shared-two",
+                        ],
+                    }
+                result.append(row)
+            return result
+        return super().query(cypher, parameters, timeout_seconds)
+
+
 
 class QueryLayerTest(unittest.TestCase):
     def test_common_defaults(self):
@@ -330,6 +374,117 @@ class QueryLayerTest(unittest.TestCase):
             result = service.execute("compare_branches", invalid)
             self.assertEqual(result["status"], "error")
             self.assertEqual(result["warnings"][0]["code"], "INVALID_REQUEST")
+
+    def test_compare_branches_embeds_bounded_structural_summary(self):
+        store = StructuralCompareBranchesStore()
+        service = QueryService(store, project_id="project-one")
+
+        result = service.execute("compare_branches", {
+            "project_id": "project-one",
+            "contract_version": "graph-native:v1",
+            "graph_build_id": "build-1",
+            "confirmed_branch_ids": ["task:0", "task:1", "task:2"],
+            "max_depth": 2,
+            "limit": 20,
+        })
+
+        self.assertEqual(result["status"], "ok")
+        comparison = result["data"]["results"][0]
+        group = comparison["partially_shared_entity_groups"][0]
+        self.assertEqual(group["branch_ids"], ["task:0", "task:1"])
+        self.assertEqual(
+            group["structural_summary"]["observed_relationship_count"], 1
+        )
+        self.assertEqual(
+            group["structural_summary"]["query_anchor_entity_ids"],
+            ["dataset:shared-one", "dataset:shared-two"],
+        )
+        self.assertEqual(comparison["topology_scope"], {
+            "max_depth": 2,
+            "relationship_types": [
+                "COMPUTED_BY", "DATASET_DEPENDS_ON", "DEPENDS_ON",
+                "DERIVED_FROM", "EMITS_SQL", "HAS_COLUMN", "HAS_DEFINITION",
+                "PRODUCES", "READS", "STORED_IN",
+            ],
+            "semantics": (
+                "LITERAL_RELATIONSHIP_INSTANCES_IN_EXACT_MEMBERSHIP_"
+                "INDUCED_SUBGRAPH"
+            ),
+            "evidence_status": "OBSERVED",
+        })
+        topology_calls = [
+            call for call in store.calls
+            if "compare_branches:structural_topology" in call[0]
+        ]
+        self.assertEqual(len(topology_calls), 1)
+        self.assertEqual(
+            topology_calls[0][1]["branch_scopes"],
+            [
+                {
+                    "branch_id": "task:0",
+                    "entity_ids": [
+                        "dataset:shared-one", "dataset:shared-two",
+                    ],
+                },
+                {
+                    "branch_id": "task:1",
+                    "entity_ids": [
+                        "dataset:shared-one", "dataset:shared-two",
+                    ],
+                },
+                {"branch_id": "task:2", "entity_ids": []},
+            ],
+        )
+
+    def test_compare_branches_preserves_core_result_when_topology_fails(self):
+        store = StructuralCompareBranchesStore(
+            topology_error=RuntimeError("topology unavailable")
+        )
+        service = QueryService(store, project_id="project-one")
+
+        result = service.execute("compare_branches", {
+            "project_id": "project-one",
+            "contract_version": "graph-native:v1",
+            "graph_build_id": "build-1",
+            "confirmed_branch_ids": ["task:0", "task:1", "task:2"],
+            "limit": 20,
+        })
+
+        self.assertEqual(result["status"], "partial")
+        comparison = result["data"]["results"][0]
+        self.assertNotIn(
+            "structural_summary",
+            comparison["partially_shared_entity_groups"][0],
+        )
+        self.assertEqual(
+            comparison["topology_scope"]["evidence_status"], "UNAVAILABLE"
+        )
+        self.assertIn(
+            "STRUCTURAL_TOPOLOGY_UNAVAILABLE",
+            [item["code"] for item in result["warnings"]],
+        )
+
+    def test_compare_branches_skips_topology_when_a_branch_is_unresolved(self):
+        store = StructuralCompareBranchesStore(unresolved_branch_id="task:2")
+        service = QueryService(store, project_id="project-one")
+
+        result = service.execute("compare_branches", {
+            "project_id": "project-one",
+            "contract_version": "graph-native:v1",
+            "graph_build_id": "build-1",
+            "confirmed_branch_ids": ["task:0", "task:1", "task:2"],
+            "limit": 20,
+        })
+
+        comparison = result["data"]["results"][0]
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(
+            comparison["topology_scope"]["evidence_status"], "UNAVAILABLE"
+        )
+        self.assertFalse(any(
+            "compare_branches:structural_topology" in cypher
+            for cypher, _, _ in store.calls
+        ))
 
     def test_compare_branches_runs_small_scope_once_without_recovery(self):
         store = AdaptiveCompareBranchesStore()

@@ -6,6 +6,10 @@ import re
 import time
 from pathlib import Path
 
+from .branch_structure import (
+    STRUCTURAL_RELATIONSHIP_TYPES,
+    attach_structural_summaries,
+)
 from .contracts import (
     CONFIDENCE_RANK,
     compact_properties,
@@ -195,6 +199,7 @@ class QueryService:
                     "derived_comparisons": [
                         "partial_sharing", "pairwise_similarity",
                         "result_column_derivation_differences",
+                        "observed_shared_group_connectivity",
                     ],
                     "unsupported_entity_layers": ["expression"],
                     "execution_recovery": ["adaptive_branch_bisection"],
@@ -760,7 +765,93 @@ class QueryService:
                 related_entity_ids=branch_ids,
             ))
 
-        status = "partial" if truncated or unresolved else "ok"
+        topology_scope = {
+            "max_depth": max_depth,
+            "relationship_types": list(STRUCTURAL_RELATIONSHIP_TYPES),
+            "semantics": (
+                "LITERAL_RELATIONSHIP_INSTANCES_IN_EXACT_MEMBERSHIP_"
+                "INDUCED_SUBGRAPH"
+            ),
+            "evidence_status": "UNAVAILABLE",
+        }
+        topology_unavailable = bool(unresolved)
+        if unresolved:
+            warnings.append(warning(
+                "STRUCTURAL_TOPOLOGY_UNAVAILABLE",
+                "Structural summaries require every requested branch to resolve; core comparison fields remain available.",
+                related_entity_ids=branch_ids,
+            ))
+        else:
+            structural_entity_ids_by_branch = {
+                branch_id: set() for branch_id in branch_ids
+            }
+            for group in shared_groups:
+                group_entity_ids = {
+                    entity_id
+                    for entity_ids in group["entity_ids_by_type"].values()
+                    for entity_id in entity_ids
+                }
+                for branch_id in group["branch_ids"]:
+                    structural_entity_ids_by_branch[branch_id].update(
+                        group_entity_ids
+                    )
+            relationship_types = "|".join(STRUCTURAL_RELATIONSHIP_TYPES)
+            try:
+                topology_rows = self.store.query(
+                    f"""
+                    /* compare_branches:structural_topology */
+                    UNWIND $branch_scopes AS branch_scope
+                    MATCH (source:KGNode {{project_key: $project_id}})-[
+                        relationship:{relationship_types}
+                    ]->(target:KGNode {{project_key: $project_id}})
+                    WHERE source.id IN branch_scope.entity_ids
+                      AND target.id IN branch_scope.entity_ids
+                    WITH relationship, source, target,
+                         collect(DISTINCT branch_scope.branch_id)
+                             AS observed_branch_ids
+                    RETURN coalesce(
+                               toString(relationship.id),
+                               elementId(relationship)
+                           ) AS relationship_id,
+                           type(relationship) AS relationship_type,
+                           source.id AS from_entity_id,
+                           target.id AS to_entity_id,
+                           observed_branch_ids
+                    ORDER BY relationship_id, relationship_type,
+                             from_entity_id, to_entity_id
+                    """,
+                    {
+                        "project_id": project_id,
+                        "branch_scopes": [
+                            {
+                                "branch_id": branch_id,
+                                "entity_ids": sorted(
+                                    structural_entity_ids_by_branch[branch_id]
+                                ),
+                            }
+                            for branch_id in branch_ids
+                        ],
+                    },
+                    timeout_seconds=COMPARE_QUERY_TIMEOUT_SECONDS,
+                )
+            except Exception:  # noqa: BLE001
+                topology_unavailable = True
+                warnings.append(warning(
+                    "STRUCTURAL_TOPOLOGY_UNAVAILABLE",
+                    "The structural topology query did not complete; core comparison fields remain available.",
+                    related_entity_ids=branch_ids,
+                ))
+            else:
+                shared_groups = attach_structural_summaries(
+                    shared_groups, topology_rows
+                )
+                topology_scope["evidence_status"] = "OBSERVED"
+
+        status = (
+            "partial"
+            if truncated or unresolved or topology_unavailable
+            else "ok"
+        )
         all_metric_ids = set().union(*metrics_by_branch.values()) if metrics_by_branch else set()
         all_definition_ids = set().union(*definitions_by_branch.values()) if definitions_by_branch else set()
         all_sql_ids = set().union(*sql_by_branch.values()) if sql_by_branch else set()
@@ -822,6 +913,7 @@ class QueryService:
                     "unique_entity_ids_by_branch_by_type": unique_by_branch_by_type,
                     "partially_shared_entity_groups": shared_groups,
                     "omitted_shared_group_count": omitted_shared_group_count,
+                    "topology_scope": topology_scope,
                     "pairwise_comparisons": pairwise_comparisons,
                     "omitted_pairwise_comparison_count": omitted_pairwise_count,
                     "write_mode_by_branch": write_modes,

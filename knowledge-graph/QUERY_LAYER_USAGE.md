@@ -89,6 +89,19 @@ python3 -m query_layer.cli compare_branches --pretty --json '{
 }'
 ```
 
+`partially_shared_entity_groups` 按精确分支成员组合分组。每个已返回的共享组包含一个
+`structural_summary`，只汇总当前图中实际存在、且两端实体都属于该精确共享组的完整关系
+实例。它表达的是精确成员组的诱导子图，不证明这些关系实际参与了每个成员分支的遍历路径。
+摘要返回观测连通组件数、连通及未连通共享实体数、关系数量与类型，以及
+最多三个稳定排序的后续查询入口。连通计算使用关系的无向投影；它不是图同构，也不是
+完整业务子图，跨成员组合的关系不会计入。
+
+结果中的单一 `topology_scope` 声明 `max_depth`、查询支持的关系类型和
+`LITERAL_RELATIONSHIP_INSTANCES_IN_EXACT_MEMBERSHIP_INDUCED_SUBGRAPH` 语义。所有结构字段均使用 `observed`
+限定；零条观测关系不证明业务上没有结构。若有请求分支未解析，或拓扑查询未完成，服务
+保留原有比较字段并返回 `partial`、`STRUCTURAL_TOPOLOGY_UNAVAILABLE`，且不生成容易被误解
+为零观测的 `structural_summary`。`common_entity_ids` 继续保留，但不会被解释为共同业务骨架。
+
 若图中没有写入方式属性，`write_mode_by_branch` 明确返回 `UNKNOWN`，不会从任务名或表名
 推断。当前图没有 Expression 实体层时，`component_counts.expressions` 返回 `null`，并在
 `evidence_status/evidence_gaps` 中标记 `UNSUPPORTED`，不会用 0 表示“确认没有表达式”。
