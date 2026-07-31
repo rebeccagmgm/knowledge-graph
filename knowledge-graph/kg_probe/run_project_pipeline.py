@@ -143,11 +143,13 @@ def main() -> None:
     parser.add_argument("--import-neo4j", action="store_true")
     parser.add_argument("--neo4j-batch-size", type=int, default=2000)
     parser.add_argument("--build-llm", action="store_true", help="Build LLM evidence, definitions, comparisons, and enhanced graph")
+    parser.add_argument("--build-asset-summaries", action="store_true", help="Build optional task/dataset summaries for query context")
     parser.add_argument("--llm-provider", choices=["mock", "openai-compatible"], default="mock")
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--llm-output-prefix", default=None)
     parser.add_argument("--llm-max-sql-chars", type=int, default=12000)
     parser.add_argument("--llm-sleep", type=float, default=0.0)
+    parser.add_argument("--asset-summary-limit", type=int, default=0)
     parser.add_argument("--force-page-code", action="store_true")
     parser.add_argument("--force-logs", action="store_true")
     parser.add_argument("--force-details", action="store_true")
@@ -451,6 +453,22 @@ def main() -> None:
                 )
             )
 
+    if args.build_asset_summaries:
+        asset_summary_cmd = [
+            py,
+            str(script_dir / "generate_asset_summaries.py"),
+            str(project_dir),
+            "--prefix",
+            graph_prefix,
+            "--provider",
+            args.llm_provider,
+        ]
+        if args.llm_model:
+            asset_summary_cmd.extend(["--model", args.llm_model])
+        if args.asset_summary_limit:
+            asset_summary_cmd.extend(["--limit", str(args.asset_summary_limit)])
+        steps.append(run_step("generate_asset_summaries", asset_summary_cmd, dry_run=args.dry_run))
+
     if args.import_neo4j:
         import_prefix = llm_output_prefix if args.build_llm else graph_prefix
         steps.append(
@@ -491,6 +509,7 @@ def main() -> None:
         "graph_prefix": graph_prefix,
         "llm_output_prefix": llm_output_prefix if args.build_llm else None,
         "llm_provider": args.llm_provider if args.build_llm else None,
+        "build_asset_summaries": args.build_asset_summaries,
         "import_neo4j": args.import_neo4j,
         "steps": steps,
     }

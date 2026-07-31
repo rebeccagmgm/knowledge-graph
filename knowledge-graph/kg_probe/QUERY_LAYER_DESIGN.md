@@ -76,6 +76,8 @@ flowchart LR
 
 `analyze_impact` 除原始受影响实体外，还应返回 `impact_groups` 和 `impact_explanations`，按直接值来源、过滤、关联、分组等原因解释影响范围。
 
+大图字段影响分析中，`max_hops` 是实际 Neo4j 路径展开上限，而不是结果返回后的过滤条件。对包含大量 `INFLUENCED_BY` 的项目，建议先用 `max_hops=3` 或 `max_hops=5` 获取局部影响，再根据需要扩大范围。
+
 ## 6. 标准请求
 
 通用请求结构：
