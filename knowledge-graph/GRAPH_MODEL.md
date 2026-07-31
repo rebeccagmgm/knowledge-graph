@@ -73,6 +73,7 @@ SQL 和表血缘：
 
 - `Dataset -[:HAS_COLUMN]-> Column`
 - `target Column -[:DERIVED_FROM]-> source Column`
+- `target Column -[:INFLUENCED_BY]-> source Column`
 - `target Column -[:GENERATED_BY_EXPRESSION]-> GeneratedExpression`
 
 指标和业务：
@@ -145,6 +146,29 @@ LLM 证据和生成：
   - `projection_ordinal`
 
 真实源字段血缘仍只通过 `DERIVED_FROM` 表示。
+
+## 间接字段影响
+
+`DERIVED_FROM` 只表示目标字段值的直接来源。部分字段虽然不直接构成输出字段的值，但会影响输出结果集或计算范围，例如：
+
+- `WHERE` 过滤条件。
+- `JOIN ON` 或 `USING` 关联条件。
+- `GROUP BY` 分组字段。
+- `HAVING` 过滤条件。
+- `QUALIFY` 过滤条件。
+- `ORDER BY` 排序字段。
+
+这些字段被建模为：
+
+- 边：`target Column -[:INFLUENCED_BY]-> source Column`
+- 关键属性：
+  - `influence_type`：`filter`、`join_condition`、`join_using`、`group_by`、`having`、`qualify`、`order_by`
+  - `expression_sql`
+  - `statement_id`
+  - `task_id`
+  - `branch_ordinal`
+
+这样字段影响分析可以区分“字段值直接来自某源字段”和“字段受到过滤、关联、分组等条件间接影响”。第一版不改变 `DERIVED_FROM` 语义，而是新增 `INFLUENCED_BY` 作为补充关系。
 
 ## Hive 到外部库同步任务
 

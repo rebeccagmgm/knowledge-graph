@@ -1,0 +1,767 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>代码逆向知识图谱成果展示</title>
+  <style>
+    :root {
+      --bg: #f7f9fc;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #637089;
+      --line: #dbe3ef;
+      --blue: #2563eb;
+      --green: #059669;
+      --amber: #b45309;
+      --red: #dc2626;
+      --purple: #7c3aed;
+      --shadow: 0 12px 32px rgba(20, 34, 61, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    header {
+      padding: 28px 36px 20px;
+      background: linear-gradient(135deg, #10233f, #1f4a78);
+      color: #fff;
+    }
+    header h1 {
+      margin: 0 0 10px;
+      font-size: 30px;
+      letter-spacing: 0;
+    }
+    header p {
+      margin: 0;
+      max-width: 980px;
+      color: rgba(255, 255, 255, 0.82);
+      line-height: 1.65;
+    }
+    main { padding: 24px 36px 36px; }
+    .grid {
+      display: grid;
+      gap: 18px;
+    }
+    .project-grid {
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      margin-bottom: 22px;
+    }
+    .card, .workspace {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .card {
+      padding: 16px;
+      min-height: 132px;
+      cursor: pointer;
+    }
+    .card:hover { border-color: #9fb4d0; }
+    .project-name {
+      font-weight: 700;
+      font-size: 16px;
+      margin-bottom: 4px;
+    }
+    .project-id {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 14px;
+      word-break: break-all;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+    }
+    .stat strong {
+      display: block;
+      font-size: 20px;
+      line-height: 1.1;
+    }
+    .stat span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .workspace {
+      display: grid;
+      grid-template-columns: 310px minmax(520px, 1fr) 310px;
+      min-height: 620px;
+      overflow: hidden;
+    }
+    .sidebar, .detail {
+      padding: 18px;
+      background: #fbfcff;
+      border-right: 1px solid var(--line);
+    }
+    .detail {
+      border-right: 0;
+      border-left: 1px solid var(--line);
+    }
+    .canvas-wrap {
+      position: relative;
+      min-height: 620px;
+      background:
+        linear-gradient(#eef3fa 1px, transparent 1px),
+        linear-gradient(90deg, #eef3fa 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+    }
+    label {
+      display: block;
+      margin: 13px 0 6px;
+      color: #344058;
+      font-size: 13px;
+      font-weight: 650;
+    }
+    input, select, button {
+      width: 100%;
+      border: 1px solid #cbd5e1;
+      border-radius: 7px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+      color: var(--ink);
+    }
+    button {
+      margin-top: 14px;
+      border: 0;
+      background: var(--blue);
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: #eaf0f8;
+      color: #24324a;
+      border: 1px solid #d7e0ec;
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: wait;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .chip {
+      width: auto;
+      margin: 0;
+      padding: 6px 9px;
+      border: 1px solid #d7e0ec;
+      background: #fff;
+      color: #334155;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .summary {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      z-index: 2;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid var(--line);
+      font-size: 13px;
+      color: var(--muted);
+      backdrop-filter: blur(8px);
+    }
+    .zoom-controls {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      z-index: 3;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 8px 18px rgba(20, 34, 61, 0.1);
+      backdrop-filter: blur(8px);
+    }
+    .zoom-controls button {
+      width: auto;
+      min-width: 38px;
+      margin: 0;
+      padding: 7px 10px;
+      border: 1px solid #d7e0ec;
+      background: #fff;
+      color: #24324a;
+      font-size: 13px;
+      line-height: 1;
+    }
+    .zoom-controls .zoom-level {
+      min-width: 46px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    svg {
+      width: 100%;
+      height: 620px;
+      display: block;
+      cursor: grab;
+      user-select: none;
+    }
+    svg.panning { cursor: grabbing; }
+    .node { cursor: pointer; }
+    .node rect {
+      stroke: #bfccdc;
+      stroke-width: 1.2;
+      fill: #fff;
+      filter: drop-shadow(0 4px 10px rgba(37, 54, 88, 0.12));
+    }
+    .node.center rect { stroke: var(--blue); stroke-width: 2.2; }
+    .node text { font-size: 12px; fill: #1f2937; pointer-events: none; }
+    .node .type { font-size: 10px; fill: #64748b; text-transform: uppercase; }
+    .edge {
+      stroke: #8aa0ba;
+      stroke-width: 1.4;
+      fill: none;
+      marker-end: url(#arrow);
+    }
+    .edge.DERIVED_FROM, .edge.INFLUENCED_BY { stroke: var(--green); }
+    .edge.DEPENDS_ON { stroke: var(--purple); }
+    .edge.DATASET_DEPENDS_ON { stroke: var(--amber); }
+    .edge.READS, .edge.WRITES, .edge.PRODUCES, .edge.CONSUMES { stroke: var(--blue); }
+    .muted { color: var(--muted); }
+    .candidate {
+      padding: 10px;
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      cursor: pointer;
+    }
+    .candidate strong { display: block; font-size: 13px; }
+    .candidate span { color: var(--muted); font-size: 12px; word-break: break-all; }
+    .kv {
+      display: grid;
+      grid-template-columns: 86px 1fr;
+      gap: 8px;
+      margin: 8px 0;
+      font-size: 13px;
+    }
+    .kv b { color: #475569; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-all;
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      border-radius: 7px;
+      padding: 10px;
+      max-height: 260px;
+      overflow: auto;
+      font-size: 12px;
+    }
+    .status {
+      margin-top: 12px;
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 13px;
+    }
+    @media (max-width: 1120px) {
+      .workspace { grid-template-columns: 280px 1fr; }
+      .detail { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); }
+    }
+    @media (max-width: 820px) {
+      header, main { padding-left: 18px; padding-right: 18px; }
+      .workspace { grid-template-columns: 1fr; }
+      .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+      svg { height: 520px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>代码逆向知识图谱成果展示</h1>
+    <p>展示已导入项目的图谱规模，并从任务、表、字段、指标等任意锚点展开局部关系图。这个页面用于汇报演示：强调图谱如何把代码、调度、数据资产和口径证据组织成可验证的上下文。</p>
+  </header>
+  <main>
+    <section class="grid project-grid" id="projectGrid"></section>
+
+    <section class="workspace">
+      <aside class="sidebar">
+        <h2>局部图探索</h2>
+        <label for="apiBase">接口地址</label>
+        <input id="apiBase" placeholder="同源访问可留空；文件模式默认 http://127.0.0.1:8790" />
+
+        <label for="projectSelect">项目</label>
+        <select id="projectSelect"></select>
+
+        <label for="queryInput">锚点</label>
+        <input id="queryInput" value="研究方向" placeholder="任务ID、表名、字段名、指标名或 entity_id" />
+
+        <label for="entityType">实体类型</label>
+        <select id="entityType">
+          <option value="">自动识别</option>
+          <option value="schedule_task">任务</option>
+          <option value="dataset">表</option>
+          <option value="column">字段</option>
+          <option value="metric">指标</option>
+        </select>
+
+        <label for="direction">展开方向</label>
+        <select id="direction">
+          <option value="downstream">下游</option>
+          <option value="upstream">上游</option>
+          <option value="both">双向</option>
+        </select>
+
+        <label for="profile">关系范围</label>
+        <select id="profile">
+          <option value="lineage">血缘综合</option>
+          <option value="column_lineage">字段血缘</option>
+          <option value="dataset_lineage">表级血缘</option>
+          <option value="schedule">调度依赖</option>
+          <option value="code">代码读写</option>
+          <option value="metric">指标口径</option>
+          <option value="all_safe">安全全量</option>
+        </select>
+
+        <label for="depth">深度</label>
+        <select id="depth">
+          <option value="2">2 跳</option>
+          <option value="3" selected>3 跳</option>
+          <option value="4">4 跳</option>
+          <option value="5">5 跳</option>
+          <option value="6">6 跳</option>
+        </select>
+
+        <button id="runBtn">展开局部图</button>
+        <div class="chips">
+          <button class="chip" data-example="研究方向">研究方向</button>
+          <button class="chip" data-example="成本中心">成本中心</button>
+          <button class="chip" data-example="打新次数">打新次数</button>
+          <button class="chip" data-example="running_phase">running_phase</button>
+        </div>
+        <div class="status" id="status">正在读取项目列表。</div>
+        <div id="candidates"></div>
+      </aside>
+
+      <section class="canvas-wrap">
+        <div class="summary" id="graphSummary">等待展开局部图</div>
+        <div class="zoom-controls" aria-label="图谱缩放控件">
+          <button id="zoomOutBtn" type="button" title="缩小">-</button>
+          <span class="zoom-level" id="zoomLevel">100%</span>
+          <button id="zoomInBtn" type="button" title="放大">+</button>
+          <button id="zoomResetBtn" type="button" title="适配">适配</button>
+        </div>
+        <svg id="graphSvg" role="img" aria-label="知识图谱局部关系图"></svg>
+      </section>
+
+      <aside class="detail">
+        <h2>节点详情</h2>
+        <div id="detailPanel" class="muted">点击图中的节点查看属性。</div>
+      </aside>
+    </section>
+  </main>
+
+  <script>
+    const PROJECT_NAMES = {
+      digital_operations: "数字化运营",
+      project_customer_report: "客户报告",
+      project_stastic_month: "统计月报",
+      t0: "T0",
+      project_sale_new: "交叉销售",
+      sale: "交叉销售（全）",
+      iresearch: "研究业务",
+      trial_project: "试验项目"
+    };
+    const KNOWN_PROJECTS = [
+      "digital_operations",
+      "project_customer_report",
+      "project_stastic_month",
+      "t0",
+      "project_sale_new",
+      "sale",
+      "iresearch",
+      "trial_project"
+    ];
+    const TYPE_COLORS = {
+      schedule_task: "#e0ecff",
+      dataset: "#e8f7ef",
+      column: "#fff4df",
+      metric: "#f0eaff",
+      sql_statement: "#f1f5f9",
+      owner: "#f8fafc",
+      project: "#e0f2fe"
+    };
+    let projects = [];
+    let lastGraph = null;
+    let selectedNodeId = null;
+    let graphView = {
+      width: 780,
+      height: 620,
+      zoom: 1,
+      centerX: 390,
+      centerY: 310,
+      isPanning: false,
+      lastClientX: 0,
+      lastClientY: 0
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const fmt = (n) => n === null || n === undefined ? "—" : Number(n || 0).toLocaleString("zh-CN");
+    const labelOfProject = (id) => PROJECT_NAMES[id] ? `${PROJECT_NAMES[id]}（${id}）` : id;
+    const escapeHtml = (text) => String(text ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    function apiBase() {
+      const input = $("apiBase");
+      const value = input?.value?.trim();
+      if (value) return value.replace(/\/$/, "");
+      if (location.protocol === "file:") return "http://127.0.0.1:8790";
+      return "";
+    }
+    function apiUrl(path) {
+      return `${apiBase()}${path}`;
+    }
+
+    function mergeProjects(apiProjects) {
+      const merged = new Map();
+      KNOWN_PROJECTS.forEach((projectId) => {
+        merged.set(projectId, {
+          project_id: projectId,
+          node_count: null,
+          edge_count: null,
+          task_count: null,
+          metric_count: null,
+          source: "known"
+        });
+      });
+      (apiProjects || []).forEach((item) => {
+        const projectId = item.project_id || item.id || item.name;
+        if (!projectId) return;
+        merged.set(projectId, {
+          ...merged.get(projectId),
+          ...item,
+          project_id: projectId,
+          source: "neo4j"
+        });
+      });
+      return [...merged.values()].sort((a, b) => {
+        const left = KNOWN_PROJECTS.indexOf(a.project_id);
+        const right = KNOWN_PROJECTS.indexOf(b.project_id);
+        if (left !== -1 || right !== -1) return (left === -1 ? 999 : left) - (right === -1 ? 999 : right);
+        return String(a.project_id).localeCompare(String(b.project_id), "zh-CN");
+      });
+    }
+
+    async function postJson(url, payload) {
+      let res;
+      try {
+        res = await fetch(apiUrl(url), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+      } catch (err) {
+        throw new Error(`无法连接查询接口：${apiUrl(url)}。请确认 query_api.py 已启动、接口地址正确，且浏览器允许访问该地址。原始错误：${err.message}`);
+      }
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || json.answer || "请求失败");
+      return json;
+    }
+
+    async function loadProjects() {
+      try {
+        let res;
+        try {
+          res = await fetch(apiUrl("/api/projects"));
+        } catch (err) {
+          throw new Error(`无法连接 ${apiUrl("/api/projects")}：${err.message}`);
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        projects = mergeProjects(json.data?.projects || []);
+        renderProjects();
+        renderProjectSelect();
+        const neo4jCount = projects.filter((item) => item.source === "neo4j").length;
+        $("status").textContent = neo4jCount
+          ? `项目列表已加载，其中 ${neo4jCount} 个项目读取到 Neo4j 统计。请选择锚点展开局部图。`
+          : "已使用内置项目列表，但未读取到 Neo4j 统计。仍可选择项目后查询。";
+      } catch (err) {
+        projects = mergeProjects([]);
+        renderProjects();
+        renderProjectSelect();
+        $("status").textContent = `读取项目统计失败，已使用内置项目列表：${err.message}`;
+      }
+    }
+
+    function renderProjects() {
+      const grid = $("projectGrid");
+      grid.innerHTML = projects.map((p) => `
+        <article class="card" data-project-id="${escapeHtml(p.project_id)}">
+          <div class="project-name">${escapeHtml(PROJECT_NAMES[p.project_id] || p.project_id)}</div>
+          <div class="project-id">${escapeHtml(p.project_id)}</div>
+          <div class="stats">
+            <div class="stat"><strong>${fmt(p.node_count)}</strong><span>节点</span></div>
+            <div class="stat"><strong>${fmt(p.edge_count)}</strong><span>关系</span></div>
+            <div class="stat"><strong>${fmt(p.task_count)}</strong><span>任务</span></div>
+            <div class="stat"><strong>${fmt(p.metric_count)}</strong><span>指标</span></div>
+          </div>
+        </article>
+      `).join("");
+      grid.querySelectorAll("[data-project-id]").forEach((card) => {
+        card.addEventListener("click", () => {
+          $("projectSelect").value = card.dataset.projectId;
+          $("status").textContent = `已选择项目：${labelOfProject(card.dataset.projectId)}`;
+        });
+      });
+    }
+
+    function renderProjectSelect() {
+      const select = $("projectSelect");
+      select.innerHTML = projects.map((p) => `<option value="${escapeHtml(p.project_id)}">${escapeHtml(labelOfProject(p.project_id))}</option>`).join("");
+      const preferred = projects.find((p) => p.project_id === "iresearch") || projects[0];
+      if (preferred) select.value = preferred.project_id;
+    }
+
+    function candidateHtml(entity) {
+      return `<div class="candidate" data-entity-id="${escapeHtml(entity.entity_id)}">
+        <strong>${escapeHtml(entity.display_name)}</strong>
+        <span>${escapeHtml(entity.entity_type)} · ${escapeHtml(entity.entity_id)}</span>
+      </div>`;
+    }
+
+    async function runGraph(entityId) {
+      const projectId = $("projectSelect").value;
+      const query = $("queryInput").value.trim();
+      const entityType = $("entityType").value;
+      const payload = {
+        project_id: projectId,
+        subject: entityId
+          ? { entity_id: entityId }
+          : (query.includes(":") && !query.includes(" ") ? { entity_id: query } : { key: query, entity_type: entityType || undefined }),
+        direction: $("direction").value,
+        relation_profile: $("profile").value,
+        max_hops: Number($("depth").value),
+        limit: 80,
+        limit_nodes: 90,
+        limit_edges: 220,
+        include_properties: true,
+        include_evidence: true
+      };
+      $("runBtn").disabled = true;
+      $("status").textContent = "正在查询局部图。";
+      $("candidates").innerHTML = "";
+      try {
+        const result = await postJson("/api/graph/neighborhood", payload);
+        if (result.status === "ambiguous") {
+          $("status").textContent = result.answer;
+          $("candidates").innerHTML = (result.entities || []).map(candidateHtml).join("");
+          document.querySelectorAll(".candidate").forEach((el) => {
+            el.addEventListener("click", () => runGraph(el.dataset.entityId));
+          });
+          return;
+        }
+        lastGraph = result.data?.visual_graph || { nodes: [], edges: [] };
+        selectedNodeId = result.data?.center_entity_id;
+        $("status").textContent = result.answer;
+        $("graphSummary").textContent = `${labelOfProject(projectId)} · ${result.data?.direction || ""} · ${fmt(result.data?.summary?.node_count)} 节点 / ${fmt(result.data?.summary?.edge_count)} 关系`;
+        drawGraph(lastGraph, selectedNodeId);
+        renderDetail(lastGraph.nodes.find((n) => n.id === selectedNodeId));
+      } catch (err) {
+        $("status").textContent = `查询失败：${err.message}`;
+      } finally {
+        $("runBtn").disabled = false;
+      }
+    }
+
+    function layoutGraph(graph) {
+      const nodes = graph.nodes || [];
+      const edges = graph.edges || [];
+      const byDepth = new Map();
+      nodes.forEach((node) => {
+        const depth = Number.isFinite(node.depth) ? node.depth : 0;
+        if (!byDepth.has(depth)) byDepth.set(depth, []);
+        byDepth.get(depth).push(node);
+      });
+      const depths = [...byDepth.keys()].sort((a, b) => a - b);
+      const width = Math.max($("graphSvg").clientWidth || 900, 780);
+      const height = Math.max(620, Math.max(...[...byDepth.values()].map((items) => items.length), 1) * 96 + 80);
+      const colGap = depths.length <= 1 ? 0 : (width - 170) / Math.max(1, depths.length - 1);
+      const positions = {};
+      depths.forEach((depth, depthIndex) => {
+        const items = byDepth.get(depth).sort((a, b) => String(a.label).localeCompare(String(b.label), "zh-CN"));
+        const usableH = height - 120;
+        items.forEach((node, rowIndex) => {
+          positions[node.id] = {
+            x: 85 + depthIndex * colGap,
+            y: 70 + (items.length === 1 ? usableH / 2 : rowIndex * (usableH / (items.length - 1)))
+          };
+        });
+      });
+      return { width, height, positions, nodes, edges };
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function resetGraphView(width, height) {
+      graphView.width = width;
+      graphView.height = height;
+      graphView.zoom = 1;
+      graphView.centerX = width / 2;
+      graphView.centerY = height / 2;
+      graphView.isPanning = false;
+      applyGraphView();
+    }
+
+    function applyGraphView() {
+      const svg = $("graphSvg");
+      const viewW = graphView.width / graphView.zoom;
+      const viewH = graphView.height / graphView.zoom;
+      const halfW = viewW / 2;
+      const halfH = viewH / 2;
+      graphView.centerX = clamp(graphView.centerX, halfW, Math.max(halfW, graphView.width - halfW));
+      graphView.centerY = clamp(graphView.centerY, halfH, Math.max(halfH, graphView.height - halfH));
+      svg.setAttribute("viewBox", `${graphView.centerX - halfW} ${graphView.centerY - halfH} ${viewW} ${viewH}`);
+      $("zoomLevel").textContent = `${Math.round(graphView.zoom * 100)}%`;
+    }
+
+    function setGraphZoom(nextZoom, anchor) {
+      const oldZoom = graphView.zoom;
+      const zoom = clamp(nextZoom, 0.5, 5);
+      if (zoom === oldZoom) return;
+      if (anchor) {
+        graphView.centerX = anchor.x - (anchor.x - graphView.centerX) * (oldZoom / zoom);
+        graphView.centerY = anchor.y - (anchor.y - graphView.centerY) * (oldZoom / zoom);
+      }
+      graphView.zoom = zoom;
+      applyGraphView();
+    }
+
+    function clientToGraphPoint(event) {
+      const svg = $("graphSvg");
+      const rect = svg.getBoundingClientRect();
+      const viewW = graphView.width / graphView.zoom;
+      const viewH = graphView.height / graphView.zoom;
+      return {
+        x: graphView.centerX - viewW / 2 + ((event.clientX - rect.left) / rect.width) * viewW,
+        y: graphView.centerY - viewH / 2 + ((event.clientY - rect.top) / rect.height) * viewH
+      };
+    }
+
+    function drawGraph(graph, centerId) {
+      const svg = $("graphSvg");
+      const { width, height, positions, nodes, edges } = layoutGraph(graph);
+      const edgeMarkup = edges.map((edge) => {
+        const s = positions[edge.source];
+        const t = positions[edge.target];
+        if (!s || !t) return "";
+        const dx = Math.max(60, Math.abs(t.x - s.x) * 0.45);
+        const path = `M ${s.x + 88} ${s.y} C ${s.x + dx} ${s.y}, ${t.x - dx} ${t.y}, ${t.x - 88} ${t.y}`;
+        return `<path class="edge ${escapeHtml(edge.type)}" d="${path}"><title>${escapeHtml(edge.type)}</title></path>`;
+      }).join("");
+      const nodeMarkup = nodes.map((node) => {
+        const p = positions[node.id] || { x: 0, y: 0 };
+        const fill = TYPE_COLORS[node.type] || "#fff";
+        const title = String(node.label || node.id);
+        const short = title.length > 18 ? `${title.slice(0, 18)}...` : title;
+        const type = String(node.type || "node");
+        return `<g class="node ${node.id === centerId ? "center" : ""}" data-node-id="${escapeHtml(node.id)}" transform="translate(${p.x - 92}, ${p.y - 30})">
+          <rect width="184" height="60" rx="7" fill="${fill}"></rect>
+          <text x="12" y="24">${escapeHtml(short)}</text>
+          <text class="type" x="12" y="44">${escapeHtml(type)}</text>
+          <title>${escapeHtml(title)}\n${escapeHtml(node.id)}</title>
+        </g>`;
+      }).join("");
+      svg.innerHTML = `
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#8aa0ba"></path>
+          </marker>
+        </defs>
+        ${edgeMarkup}
+        ${nodeMarkup}
+      `;
+      svg.querySelectorAll(".node").forEach((el) => {
+        el.addEventListener("click", () => {
+          selectedNodeId = el.dataset.nodeId;
+          renderDetail(nodes.find((node) => node.id === selectedNodeId));
+        });
+      });
+      resetGraphView(width, height);
+    }
+
+    function renderDetail(node) {
+      const panel = $("detailPanel");
+      if (!node) {
+        panel.innerHTML = "点击图中的节点查看属性。";
+        return;
+      }
+      panel.innerHTML = `
+        <div class="kv"><b>名称</b><span>${escapeHtml(node.label)}</span></div>
+        <div class="kv"><b>类型</b><span>${escapeHtml(node.type)}</span></div>
+        <div class="kv"><b>ID</b><span>${escapeHtml(node.id)}</span></div>
+        <div class="kv"><b>深度</b><span>${escapeHtml(node.depth)}</span></div>
+        <label>属性</label>
+        <pre>${escapeHtml(JSON.stringify(node.properties || {}, null, 2))}</pre>
+      `;
+    }
+
+    $("runBtn").addEventListener("click", () => runGraph());
+    $("zoomInBtn").addEventListener("click", () => setGraphZoom(graphView.zoom * 1.25));
+    $("zoomOutBtn").addEventListener("click", () => setGraphZoom(graphView.zoom / 1.25));
+    $("zoomResetBtn").addEventListener("click", () => resetGraphView(graphView.width, graphView.height));
+    $("graphSvg").addEventListener("wheel", (event) => {
+      if (!lastGraph) return;
+      event.preventDefault();
+      const factor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+      setGraphZoom(graphView.zoom * factor, clientToGraphPoint(event));
+    }, { passive: false });
+    $("graphSvg").addEventListener("mousedown", (event) => {
+      if (!lastGraph || (event.target.closest && event.target.closest(".node"))) return;
+      graphView.isPanning = true;
+      graphView.lastClientX = event.clientX;
+      graphView.lastClientY = event.clientY;
+      $("graphSvg").classList.add("panning");
+    });
+    window.addEventListener("mousemove", (event) => {
+      if (!graphView.isPanning) return;
+      const svg = $("graphSvg");
+      const rect = svg.getBoundingClientRect();
+      const dx = event.clientX - graphView.lastClientX;
+      const dy = event.clientY - graphView.lastClientY;
+      graphView.centerX -= dx * ((graphView.width / graphView.zoom) / rect.width);
+      graphView.centerY -= dy * ((graphView.height / graphView.zoom) / rect.height);
+      graphView.lastClientX = event.clientX;
+      graphView.lastClientY = event.clientY;
+      applyGraphView();
+    });
+    window.addEventListener("mouseup", () => {
+      graphView.isPanning = false;
+      $("graphSvg").classList.remove("panning");
+    });
+    $("apiBase").value = localStorage.getItem("kg_showcase_api_base") || (location.protocol === "file:" ? "http://127.0.0.1:8790" : "");
+    $("apiBase").addEventListener("change", () => {
+      localStorage.setItem("kg_showcase_api_base", $("apiBase").value.trim());
+      loadProjects();
+    });
+    document.querySelectorAll("[data-example]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        $("queryInput").value = btn.dataset.example;
+        runGraph();
+      });
+    });
+    window.addEventListener("resize", () => {
+      if (lastGraph) drawGraph(lastGraph, selectedNodeId);
+    });
+    loadProjects();
+  </script>
+</body>
+</html>

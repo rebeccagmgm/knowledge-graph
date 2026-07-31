@@ -60,6 +60,8 @@ def confidence_for_edge(edge_item: dict) -> str:
         if str(source_resolution).startswith("cte_"):
             return "medium"
         return "low"
+    if rel_type == "INFLUENCED_BY":
+        return "medium"
     if rel_type == "GENERATED_BY_EXPRESSION":
         return "medium"
     if rel_type in {"PRODUCES", "CONSUMES", "COMPUTED_BY", "OWNS", "BELONGS_TO_LAYER", "EMITS_SQL"}:
@@ -100,7 +102,7 @@ def fact_type_for_edge(edge_item: dict) -> str:
         return "schedule_lineage"
     if rel_type in {"READS", "WRITES", "DATASET_DEPENDS_ON", "PRODUCES", "CONSUMES"}:
         return "table_lineage"
-    if rel_type in {"DERIVED_FROM", "HAS_COLUMN", "GENERATED_BY_EXPRESSION"}:
+    if rel_type in {"DERIVED_FROM", "INFLUENCED_BY", "HAS_COLUMN", "GENERATED_BY_EXPRESSION"}:
         return "column_lineage"
     if rel_type in {"STORED_IN", "COMPUTED_BY", "HAS_DEFINITION"}:
         return "metric_lineage"
@@ -111,6 +113,35 @@ def fact_type_for_edge(edge_item: dict) -> str:
     if rel_type in {"BELONGS_TO_LAYER"}:
         return "classification"
     return "relationship"
+
+
+def quality_profile(props: dict) -> dict:
+    confidence = props.get("confidence", "medium")
+    confidence_score = {"high": 35, "medium": 25, "low": 10, "unknown": 0}.get(str(confidence).lower(), 0)
+    source_system = str(props.get("source_system") or "").lower()
+    source_score = 25 if source_system in {"horae", "szconnector", "sqlglot"} else (15 if source_system else 8)
+    evidence_score = 20 if (props.get("statement_id") or props.get("task_id") or props.get("evidence_from_id")) else 8
+    inferred = bool(props.get("inferred"))
+    inferred_penalty = 10 if inferred else 0
+    review_bonus = 5 if props.get("review_status") == "confirmed" else 0
+    score = max(0, min(100, confidence_score + source_score + evidence_score + review_bonus - inferred_penalty))
+    if score >= 75:
+        tier = "high_quality"
+        admission = "accepted"
+    elif score >= 50:
+        tier = "usable_with_context"
+        admission = "accepted_with_inference" if inferred else "accepted"
+    elif score >= 30:
+        tier = "candidate"
+        admission = "needs_review"
+    else:
+        tier = "low_quality"
+        admission = "temporary_context"
+    return {
+        "quality_score": score,
+        "quality_tier": tier,
+        "knowledge_admission": admission,
+    }
 
 
 def decorate_facts(
@@ -131,6 +162,7 @@ def decorate_facts(
         props.setdefault("built_at", built_at)
         props.setdefault("confidence", "high" if props.get("source_system") in {"horae", "szconnector"} else "medium")
         props.setdefault("inferred", props.get("source_type") in {"inferred", "sql_lineage_inferred"})
+        props.update({key: value for key, value in quality_profile(props).items() if key not in props})
     for edge_item in edges.values():
         props = edge_item.setdefault("properties", {})
         props.setdefault("fact_type", fact_type_for_edge(edge_item))
@@ -142,6 +174,7 @@ def decorate_facts(
         props.setdefault("inferred", props.get("source_type") in {"schedule_dependency_outputs", "dataset_name_rule", "task_detail_sync_info", "sql_lineage_inferred"})
         props.setdefault("evidence_from_id", edge_item.get("from"))
         props.setdefault("evidence_to_id", edge_item.get("to"))
+        props.update({key: value for key, value in quality_profile(props).items() if key not in props})
 
 
 def owner_ids(raw: str) -> list[str]:
@@ -295,6 +328,7 @@ def main() -> None:
     datasets = load(base / f"{args.prefix}_datasets.json", [])
     dataset_edges = load(base / f"{args.prefix}_dataset_edges.json", [])
     column_lineage = load(base / f"{args.prefix}_column_lineage.json", [])
+    column_influence = load(base / f"{args.prefix}_column_influence.json", [])
     logs = load(base / "log_artifacts_full.json", load(base / "log_artifacts.json", []))
     dms_records = load(base / "sz_metadata" / "dataset_dms.json", [])
     indicator_records = load(base / "sz_metadata" / "indicator_registry.json", [])
@@ -726,6 +760,36 @@ def main() -> None:
             target_resolution=item.get("target_resolution"),
             branch_ordinal=item.get("branch_ordinal"),
             projection_ordinal=item.get("projection_ordinal"),
+            source_system=item.get("source_system"),
+            source_type=item.get("source_type"),
+        )
+
+    for item in column_influence:
+        source_dataset = (item.get("source_dataset") or "").lower()
+        target_dataset = (item.get("target_dataset") or "").lower()
+        source_column = item.get("source_column") or ""
+        target_column = item.get("target_column") or ""
+        if not source_dataset or not target_dataset or not source_column or not target_column:
+            continue
+        source_column_id = add_column_node(nodes, edges, source_dataset, source_column)
+        target_column_id = add_column_node(nodes, edges, target_dataset, target_column)
+        statement_id = f"sql:{item.get('statement_id')}"
+        edge_id = (
+            f"{target_column_id}->INFLUENCED_BY->{source_column_id}:"
+            f"{item.get('statement_id')}:{item.get('branch_ordinal')}:{item.get('influence_type')}"
+        )
+        edges[edge_id] = edge(
+            edge_id,
+            target_column_id,
+            source_column_id,
+            "INFLUENCED_BY",
+            statement_id=statement_id,
+            task_id=item.get("task_id"),
+            source_resolution=item.get("source_resolution"),
+            target_resolution=item.get("target_resolution"),
+            branch_ordinal=item.get("branch_ordinal"),
+            influence_type=item.get("influence_type"),
+            expression_sql=item.get("expression_sql"),
             source_system=item.get("source_system"),
             source_type=item.get("source_type"),
         )

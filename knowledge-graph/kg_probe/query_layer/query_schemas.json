@@ -62,9 +62,11 @@
     "get_column_context": {"requiredAny": ["column", "entity_id", "subject"]},
     "trace_upstream": {"required": ["subject"]},
     "trace_downstream": {"required": ["subject"]},
+    "get_graph_neighborhood": {"required": ["subject"]},
     "analyze_impact": {"required": ["subject", "change_type"]},
     "compare_metric_definitions": {"requiredAny": ["metric_id", "entity_id", "subject"]},
     "find_definition_issues": {"required": ["issue_types"]},
+    "get_recent_changes": {"required": ["project_id"]},
     "explain_lineage_path": {"required": ["from_entity_id", "to_entity_id"]}
   }
 }

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from query_layer.contracts import response, validate_common
 from query_layer.service import QueryService, entity_ref
@@ -8,6 +11,59 @@ from query_layer.service import QueryService, entity_ref
 
 class EmptyStore:
     def query(self, cypher, parameters=None):
+        return []
+
+
+class RecordingStore:
+    def __init__(self):
+        self.queries = []
+
+    def query(self, cypher, parameters=None):
+        self.queries.append((cypher, parameters or {}))
+        return []
+
+
+class NeighborhoodStore:
+    def __init__(self):
+        self.queries = []
+
+    def query(self, cypher, parameters=None):
+        self.queries.append((cypher, parameters or {}))
+        if "MATCH (n:KGNode" in cypher:
+            return [
+                {
+                    "n": {
+                        "id": "column:a.x",
+                        "labels": ["Column"],
+                        "properties": {"name": "x", "project_key": "demo"},
+                    }
+                }
+            ]
+        if "OPTIONAL MATCH p=" in cypher:
+            return [
+                {
+                    "center": {
+                        "id": "column:a.x",
+                        "labels": ["Column"],
+                        "properties": {"name": "x", "project_key": "demo"},
+                    },
+                    "p": {
+                        "nodes": [
+                            {"id": "column:a.x", "labels": ["Column"], "properties": {"name": "x"}},
+                            {"id": "column:b.x", "labels": ["Column"], "properties": {"name": "x"}},
+                        ],
+                        "edges": [
+                            {
+                                "id": "e1",
+                                "type": "INFLUENCED_BY",
+                                "from": "column:b.x",
+                                "to": "column:a.x",
+                                "properties": {"confidence": "high", "task_id": "9"},
+                            }
+                        ],
+                    },
+                }
+            ]
         return []
 
 
@@ -53,6 +109,81 @@ class QueryLayerTest(unittest.TestCase):
     def test_unknown_primitive_returns_protocol_error(self):
         service = QueryService(EmptyStore())
         result = service.execute("drop_database", {})
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["warnings"][0]["code"], "INVALID_REQUEST")
+
+    def test_recent_changes_reads_incremental_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            changes_dir = project_dir / "incremental" / "changes"
+            changes_dir.mkdir(parents=True)
+            (project_dir / "incremental" / "state.json").write_text(
+                json.dumps({"last_scan_at": "2026-07-28T10:00:00", "last_semantic_change": True}),
+                encoding="utf-8",
+            )
+            (changes_dir / "20260728.json").write_text(
+                json.dumps(
+                    {
+                        "project_id": "demo",
+                        "semantic_change": True,
+                        "code_changed_task_ids": ["1", "2"],
+                        "affected_task_ids": ["3"],
+                        "affected_metric_ids": ["m1"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            service = QueryService(EmptyStore(), project_id="demo", project_dir=project_dir)
+            result = service.execute("get_recent_changes", {"project_id": "demo"})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["data"]["summary"]["event_count"], 1)
+            self.assertEqual(result["data"]["summary"]["semantic_change_event_count"], 1)
+            self.assertEqual(result["data"]["events"][0]["code_changed_task_count"], 2)
+            self.assertEqual(result["data"]["events"][0]["affected_metric_ids_sample"], ["m1"])
+
+    def test_impact_groups_respects_requested_hops(self):
+        store = RecordingStore()
+        service = QueryService(store)
+        node = {"id": "column:a.x", "labels": ["Column"], "properties": {"name": "x"}}
+
+        service._impact_groups(node, {"project_id": "demo", "max_hops": 3})
+
+        self.assertIn("*1..3", store.queries[0][0])
+        self.assertNotIn("*1..50", store.queries[0][0])
+
+    def test_graph_neighborhood_returns_visual_graph(self):
+        service = QueryService(NeighborhoodStore(), project_id="demo")
+        result = service.execute(
+            "get_graph_neighborhood",
+            {
+                "project_id": "demo",
+                "subject": {"entity_id": "column:a.x"},
+                "direction": "downstream",
+                "relation_profile": "column_lineage",
+                "max_hops": 2,
+            },
+        )
+
+        self.assertEqual(result["status"], "ok")
+        graph = result["data"]["visual_graph"]
+        self.assertEqual([node["id"] for node in graph["nodes"]], ["column:a.x", "column:b.x"])
+        self.assertEqual(graph["edges"][0]["source"], "column:a.x")
+        self.assertEqual(graph["edges"][0]["target"], "column:b.x")
+        self.assertEqual(graph["edges"][0]["graph_source"], "column:b.x")
+
+    def test_graph_neighborhood_rejects_unsafe_edge_type(self):
+        service = QueryService(NeighborhoodStore(), project_id="demo")
+        result = service.execute(
+            "get_graph_neighborhood",
+            {
+                "project_id": "demo",
+                "subject": {"entity_id": "column:a.x"},
+                "edge_types": ["OWNS"],
+            },
+        )
+
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["warnings"][0]["code"], "INVALID_REQUEST")
 
