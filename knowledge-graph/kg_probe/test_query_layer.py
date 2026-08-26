@@ -23,6 +23,50 @@ class RecordingStore:
         return []
 
 
+class NeighborhoodStore:
+    def __init__(self):
+        self.queries = []
+
+    def query(self, cypher, parameters=None):
+        self.queries.append((cypher, parameters or {}))
+        if "MATCH (n:KGNode" in cypher:
+            return [
+                {
+                    "n": {
+                        "id": "column:a.x",
+                        "labels": ["Column"],
+                        "properties": {"name": "x", "project_key": "demo"},
+                    }
+                }
+            ]
+        if "OPTIONAL MATCH p=" in cypher:
+            return [
+                {
+                    "center": {
+                        "id": "column:a.x",
+                        "labels": ["Column"],
+                        "properties": {"name": "x", "project_key": "demo"},
+                    },
+                    "p": {
+                        "nodes": [
+                            {"id": "column:a.x", "labels": ["Column"], "properties": {"name": "x"}},
+                            {"id": "column:b.x", "labels": ["Column"], "properties": {"name": "x"}},
+                        ],
+                        "edges": [
+                            {
+                                "id": "e1",
+                                "type": "INFLUENCED_BY",
+                                "from": "column:b.x",
+                                "to": "column:a.x",
+                                "properties": {"confidence": "high", "task_id": "9"},
+                            }
+                        ],
+                    },
+                }
+            ]
+        return []
+
+
 class QueryLayerTest(unittest.TestCase):
     def test_common_defaults(self):
         result = validate_common({})
@@ -108,6 +152,40 @@ class QueryLayerTest(unittest.TestCase):
 
         self.assertIn("*1..3", store.queries[0][0])
         self.assertNotIn("*1..50", store.queries[0][0])
+
+    def test_graph_neighborhood_returns_visual_graph(self):
+        service = QueryService(NeighborhoodStore(), project_id="demo")
+        result = service.execute(
+            "get_graph_neighborhood",
+            {
+                "project_id": "demo",
+                "subject": {"entity_id": "column:a.x"},
+                "direction": "downstream",
+                "relation_profile": "column_lineage",
+                "max_hops": 2,
+            },
+        )
+
+        self.assertEqual(result["status"], "ok")
+        graph = result["data"]["visual_graph"]
+        self.assertEqual([node["id"] for node in graph["nodes"]], ["column:a.x", "column:b.x"])
+        self.assertEqual(graph["edges"][0]["source"], "column:a.x")
+        self.assertEqual(graph["edges"][0]["target"], "column:b.x")
+        self.assertEqual(graph["edges"][0]["graph_source"], "column:b.x")
+
+    def test_graph_neighborhood_rejects_unsafe_edge_type(self):
+        service = QueryService(NeighborhoodStore(), project_id="demo")
+        result = service.execute(
+            "get_graph_neighborhood",
+            {
+                "project_id": "demo",
+                "subject": {"entity_id": "column:a.x"},
+                "edge_types": ["OWNS"],
+            },
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["warnings"][0]["code"], "INVALID_REQUEST")
 
 
 if __name__ == "__main__":

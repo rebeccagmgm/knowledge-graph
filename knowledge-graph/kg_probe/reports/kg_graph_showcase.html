@@ -163,6 +163,12 @@
       font-size: 12px;
       font-weight: 600;
     }
+    .hint {
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
     .summary {
       position: absolute;
       top: 14px;
@@ -232,6 +238,16 @@
       stroke-width: 1.4;
       fill: none;
       marker-end: url(#arrow);
+    }
+    .edge-label {
+      fill: #334155;
+      stroke: rgba(255, 255, 255, 0.9);
+      stroke-width: 4px;
+      paint-order: stroke;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0;
+      pointer-events: none;
     }
     .edge.DERIVED_FROM, .edge.INFLUENCED_BY { stroke: var(--green); }
     .edge.DEPENDS_ON { stroke: var(--purple); }
@@ -331,6 +347,7 @@
           <option value="metric">指标口径</option>
           <option value="all_safe">安全全量</option>
         </select>
+        <div class="hint" id="relationHint"></div>
 
         <label for="depth">深度</label>
         <select id="depth">
@@ -400,6 +417,32 @@
       owner: "#f8fafc",
       project: "#e0f2fe"
     };
+    const RELATION_PROFILES = {
+      lineage: ["DEPENDS_ON", "PRODUCES", "CONSUMES", "EMITS_SQL", "READS", "WRITES", "DATASET_DEPENDS_ON", "HAS_COLUMN", "DERIVED_FROM", "INFLUENCED_BY", "STORED_IN", "COMPUTED_BY"],
+      column_lineage: ["HAS_COLUMN", "DERIVED_FROM", "INFLUENCED_BY"],
+      dataset_lineage: ["DATASET_DEPENDS_ON", "PRODUCES", "CONSUMES", "READS", "WRITES"],
+      schedule: ["DEPENDS_ON"],
+      code: ["EMITS_SQL", "READS", "WRITES", "PRODUCES", "CONSUMES"],
+      metric: ["STORED_IN", "COMPUTED_BY", "HAS_DEFINITION", "HAS_CODE_DEFINITION", "HAS_COMPARISON"],
+      all_safe: ["DEPENDS_ON", "PRODUCES", "CONSUMES", "EMITS_SQL", "READS", "WRITES", "DATASET_DEPENDS_ON", "HAS_COLUMN", "DERIVED_FROM", "INFLUENCED_BY", "STORED_IN", "COMPUTED_BY", "HAS_DEFINITION", "HAS_CODE_DEFINITION", "HAS_COMPARISON"]
+    };
+    const RELATION_LABELS = {
+      DEPENDS_ON: "调度依赖",
+      PRODUCES: "产出",
+      CONSUMES: "消费",
+      EMITS_SQL: "执行SQL",
+      READS: "读",
+      WRITES: "写",
+      DATASET_DEPENDS_ON: "表血缘",
+      HAS_COLUMN: "包含字段",
+      DERIVED_FROM: "字段来源",
+      INFLUENCED_BY: "上下文影响",
+      STORED_IN: "存储于",
+      COMPUTED_BY: "计算任务",
+      HAS_DEFINITION: "登记口径",
+      HAS_CODE_DEFINITION: "代码口径",
+      HAS_COMPARISON: "口径比对"
+    };
     let projects = [];
     let lastGraph = null;
     let selectedNodeId = null;
@@ -427,6 +470,14 @@
     }
     function apiUrl(path) {
       return `${apiBase()}${path}`;
+    }
+    function relationLabel(type) {
+      return RELATION_LABELS[type] || type || "关系";
+    }
+    function renderRelationHint() {
+      const profile = $("profile").value;
+      const relations = RELATION_PROFILES[profile] || [];
+      $("relationHint").textContent = relations.map((type) => `${relationLabel(type)}(${type})`).join("、");
     }
 
     function mergeProjects(apiProjects) {
@@ -659,13 +710,25 @@
     function drawGraph(graph, centerId) {
       const svg = $("graphSvg");
       const { width, height, positions, nodes, edges } = layoutGraph(graph);
-      const edgeMarkup = edges.map((edge) => {
+      const edgeMarkup = edges.map((edge, index) => {
         const s = positions[edge.source];
         const t = positions[edge.target];
         if (!s || !t) return "";
         const dx = Math.max(60, Math.abs(t.x - s.x) * 0.45);
+        const pathId = `edge-path-${index}`;
         const path = `M ${s.x + 88} ${s.y} C ${s.x + dx} ${s.y}, ${t.x - dx} ${t.y}, ${t.x - 88} ${t.y}`;
-        return `<path class="edge ${escapeHtml(edge.type)}" d="${path}"><title>${escapeHtml(edge.type)}</title></path>`;
+        const title = [
+          `${relationLabel(edge.type)} (${edge.type})`,
+          edge.task_id ? `task_id: ${edge.task_id}` : "",
+          edge.statement_id ? `statement_id: ${edge.statement_id}` : "",
+          edge.confidence ? `confidence: ${edge.confidence}` : "",
+          edge.influence_type ? `influence_type: ${edge.influence_type}` : ""
+        ].filter(Boolean).join("\n");
+        return `
+          <path id="${pathId}" class="edge ${escapeHtml(edge.type)}" d="${path}"><title>${escapeHtml(title)}</title></path>
+          <text class="edge-label">
+            <textPath href="#${pathId}" startOffset="50%" text-anchor="middle">${escapeHtml(relationLabel(edge.type))}</textPath>
+          </text>`;
       }).join("");
       const nodeMarkup = nodes.map((node) => {
         const p = positions[node.id] || { x: 0, y: 0 };
@@ -715,6 +778,7 @@
     }
 
     $("runBtn").addEventListener("click", () => runGraph());
+    $("profile").addEventListener("change", renderRelationHint);
     $("zoomInBtn").addEventListener("click", () => setGraphZoom(graphView.zoom * 1.25));
     $("zoomOutBtn").addEventListener("click", () => setGraphZoom(graphView.zoom / 1.25));
     $("zoomResetBtn").addEventListener("click", () => resetGraphView(graphView.width, graphView.height));
@@ -761,6 +825,7 @@
     window.addEventListener("resize", () => {
       if (lastGraph) drawGraph(lastGraph, selectedNodeId);
     });
+    renderRelationHint();
     loadProjects();
   </script>
 </body>

@@ -85,6 +85,13 @@ flowchart TB
         L4["人工补充口径扩展口"]
     end
 
+    subgraph Ontology["Ontology 候选层"]
+        O1["指标/字段画像"]
+        O2["口径族候选发现"]
+        O3["关系类型与证据"]
+        O4["人工复核清单"]
+    end
+
     subgraph Graph["图谱层"]
         G1["Neo4j 导入"]
         G2["图完整性验证"]
@@ -107,6 +114,9 @@ flowchart TB
 
     Source --> Collect --> Parse --> Fact --> Graph --> Query
     Fact --> LLM --> Graph
+    Fact --> Ontology
+    LLM --> Ontology
+    Ontology --> Graph
     Incremental --> Collect
 ```
 
@@ -349,11 +359,161 @@ LLM 不替代图谱事实抽取。它的作用是：
 
 人工补充采用轻量扩展文件 `manual_metric_overrides.json`，不建设完整审批流。
 
-## 9. 增量更新
+## 9. Ontology 候选发现
+
+Ontology 候选层用于从现有图谱事实中发现“项目里可能存在的业务对象、业务属性、度量概念、参考数据和跨表概念关系”。当前保留第二版路线，即 `ontology_v2/`：
+
+```text
+表主题识别 -> 字段组语义归纳 -> 血缘证据验证 -> 跨表概念对齐 -> 可选 LLM 精炼
+```
+
+第二版不再依赖单字段相似度来直接推断口径族，而是先理解表，再归纳表内字段组，然后用血缘证据验证，最后做跨表概念对齐。所有自动发现结果默认只作为候选，不直接改变正式图谱结论。
+
+### 9.1 输入证据
+
+输入为项目图谱产物目录，优先读取：
+
+```text
+strategy_llm_graph_nodes.jsonl
+strategy_llm_graph_edges.jsonl
+```
+
+如果没有 LLM 图谱产物，则回退读取：
+
+```text
+strategy_graph_nodes.jsonl
+strategy_graph_edges.jsonl
+```
+
+主要使用以下证据：
+
+- 指标名称、英文名、登记口径、代码口径、口径比对状态。
+- 指标存储表、代码来源表、计算任务。
+- 字段名称、字段注释、所属表。
+- 字段直接血缘、间接影响血缘、共同上游和共同下游。
+- 节点和边上的 `confidence`、`quality_score`、`knowledge_admission`。
+
+### 9.2 表主题与字段组发现
+
+一键执行：
+
+```bash
+python3 run_ontology_v2.py <project_dir> \
+  --prefix strategy \
+  --project-key <project_id>
+```
+
+默认内部四步：
+
+| 步骤 | 脚本 | 输出 |
+| --- | --- | --- |
+| 表主题识别 | `build_table_profiles.py` | `table_profiles.jsonl` |
+| 字段组语义归纳 | `discover_field_groups.py` | `field_groups.jsonl` |
+| 血缘路径验证 | `verify_concept_evidence.py` | `verified_field_groups.jsonl`、`field_group_relations.jsonl` |
+| 跨表概念对齐 | `align_concepts.py` | `concept_candidates.jsonl`、`concept_relations.jsonl` |
+
+默认流程为离线规则版，不依赖 LLM。需要更自然的业务解释和拆并建议时，可以显式启用 LLM 精炼：
+
+```bash
+python3 refine_ontology_concepts_with_llm.py <project_dir> \
+  --provider openai-compatible \
+  --model deepseek-v4-pro \
+  --base-url https://api.deepseek.com \
+  --limit 5 \
+  --min-score 0.79
+```
+
+也可以在一键流程中启用：
+
+```bash
+python3 run_ontology_v2.py <project_dir> \
+  --prefix strategy \
+  --project-key <project_id> \
+  --refine-ontology-llm \
+  --llm-provider openai-compatible \
+  --llm-model deepseek-v4-pro \
+  --llm-base-url https://api.deepseek.com
+```
+
+LLM 精炼不会覆盖规则候选，而是生成独立的 `OntologyLLMRefinement` 事实，用于解释候选概念、给出拆分/合并建议、列出证据边界和业务复核问题。
+
+新增候选节点类型：
+
+| 节点 | 含义 |
+| --- | --- |
+| `TableProfile` | 表主题画像，如结果事实表、参数配置表、主数据表、关系映射表 |
+| `SemanticFieldGroup` | 表内字段组，如合约/协议、交易对手/客户、产品/标的、销售收入 |
+| `OntologyEvidence` | 字段组的血缘证据验证结果 |
+| `ConceptCandidate` | 跨表对齐后的候选业务概念 |
+| `OntologyLLMRefinement` | LLM 对候选概念的业务命名、解释、拆并建议和证据边界 |
+
+新增候选关系类型：
+
+| 关系 | 含义 |
+| --- | --- |
+| `HAS_TABLE_PROFILE` | 表关联表画像 |
+| `HAS_FIELD_GROUP` | 表画像关联字段组 |
+| `CONTAINS_COLUMN` | 字段组包含字段 |
+| `SUPPORTED_BY` | 字段组由血缘证据支持 |
+| `DERIVED_FROM_GROUP` | 字段组之间存在字段血缘派生 |
+| `ALIGNED_TO` | 字段组对齐到候选概念 |
+| `REFINED_BY_LLM` | 候选概念关联 LLM 精炼结果 |
+
+`project_sale_new` 的 `ontology_v2` 验证结果：
+
+| 项 | 数量 |
+| --- | ---: |
+| 表画像 | 370 |
+| 字段组 | 675 |
+| 强证据字段组 | 134 |
+| 字段组派生关系 | 311 |
+| 跨表概念候选 | 78 |
+| 跨表候选关系 | 2929 |
+
+抽样可以发现“场外衍生品销售日报”“合约/协议”“交易对手/客户”“产品/标的”“销售收入/创收”“费率/费用/收益率”“本金/保证金”等业务对象和概念族。
+
+接入 DeepSeek 后，对 `project_sale_new` 5 个高分候选做真实 LLM 精炼：
+
+| 规则候选 | LLM 建议概念名 | 置信度 | 关键判断 |
+| --- | --- | --- | --- |
+| 本金/保证金 | 场外衍生品名义本金与保证金 | high | 建议拆成“名义本金”和“保证金”两个概念 |
+| 时间/生命周期 | 合约生命周期关键日期 | medium | 可保留整体，但需区分约定日期、实际执行日期和系统 ETL 日期 |
+| 交易对手/客户 | 交易对手 | medium | 建议确认“交易对手”和“客户”是否等价 |
+| 合约/协议 | OTC 衍生品公司销售协议 | high | 强证据集中在 `t98_otc_deri_comp_sale_info` 系列表 |
+| 费率/费用/收益率 | 场外衍生品合约费率/费用/收益率 | high | 建议按费率、费用、收益率，或按期权/TRS 业务类型拆分 |
+
+### 9.3 输出产物
+
+`ontology_v2/` 输出：
+
+```text
+table_profiles.jsonl
+field_groups.jsonl
+verified_field_groups.jsonl
+field_group_relations.jsonl
+concept_candidates.jsonl
+concept_relations.jsonl
+llm_refined_concepts.jsonl
+ontology_llm_refinement_summary.json
+*_graph_nodes.jsonl
+*_graph_edges.jsonl
+ontology_v2_manifest.json
+```
+
+### 9.4 入图原则
+
+Ontology 候选采用“候选先行、人工确认、确认后入正式知识”的原则：
+
+- 自动发现结果默认 `knowledge_admission=needs_review`。
+- 高分候选也不自动等同于标准口径。
+- 人工确认后可升级为正式 `ConceptFamily`、`BELONGS_TO_FAMILY`、`SAME_SOURCE_VARIANT` 等关系。
+- 低证据或冲突候选保留在复核清单，不参与确定性问答。
+
+## 10. 增量更新
 
 当前增量更新采用“轻量检测、变化后整项目重建”的策略。
 
-### 9.1 检测内容
+### 10.1 检测内容
 
 - 任务新增、删除。
 - 调度依赖变化。
@@ -364,7 +524,7 @@ LLM 不替代图谱事实抽取。它的作用是：
 - 表字段元数据变化。
 - 指标登记变化。
 
-### 9.2 更新流程
+### 10.2 更新流程
 
 ```text
 读取项目登记配置
@@ -377,7 +537,7 @@ LLM 不替代图谱事实抽取。它的作用是：
 → 如果有语义变化，计算受影响任务/指标并触发项目重建
 ```
 
-### 9.3 质量门禁
+### 10.3 质量门禁
 
 出现以下情况时，本轮增量不覆盖旧基线：
 
@@ -391,7 +551,7 @@ LLM 不替代图谱事实抽取。它的作用是：
 
 失败记录写入 `incremental/failures/`。
 
-### 9.4 增量产物
+### 10.4 增量产物
 
 ```text
 incremental/current_snapshot.json
@@ -403,7 +563,7 @@ incremental/scan.lock
 
 当前不做 Neo4j 节点级局部修改。检测到语义变化后，按项目重建并重新导入，保证图内事实一致。
 
-## 10. 图谱导入与验证
+## 11. 图谱导入与验证
 
 图谱导入 Neo4j 前后都会执行质量检查。
 
@@ -420,7 +580,7 @@ incremental/scan.lock
 
 导入支持 `project_id` 隔离。多项目可以共存于同一个 Neo4j 实例，下游查询必须显式传入 `project_id`。
 
-## 11. 查询层
+## 12. 查询层
 
 查询层定位为：
 
@@ -430,7 +590,7 @@ incremental/scan.lock
 
 LLM 或机器人不直接执行任意 Cypher，而是调用受控查询原语。查询层负责参数校验、项目隔离、分页、实体消歧、证据返回和错误边界。
 
-### 11.1 标准返回协议
+### 12.1 标准返回协议
 
 所有查询原语统一返回：
 
@@ -459,7 +619,7 @@ diagnostics
 | `not_found` | 未找到目标实体 |
 | `error` | 请求非法或查询失败 |
 
-### 11.2 当前查询原语
+### 12.2 当前查询原语
 
 当前支持 14 个查询原语：
 
@@ -480,7 +640,7 @@ diagnostics
 | `get_recent_changes` | 查询增量变化事件 |
 | `get_graph_neighborhood` | 从任意节点展开局部知识图谱 |
 
-### 11.3 HTTP API
+### 12.3 HTTP API
 
 当前已封装 HTTP 查询服务，主要接口包括：
 
@@ -506,7 +666,7 @@ POST /api/graph/neighborhood
 
 接口支持分页、大结果摘要、项目内查询和实体歧义返回。
 
-## 12. 安全与审计
+## 13. 安全与审计
 
 - Cookie、Token、API Key、Neo4j 密码不得进入代码仓库。
 - 真实 SQL、运行日志、表样例和图谱产物不进入源码 Git 仓库。
@@ -515,7 +675,7 @@ POST /api/graph/neighborhood
 - 查询接口必须传入 `project_id`，默认在项目内搜索和查询。
 - 面向多人使用时，Neo4j 可只在服务端本机访问，同事通过查询 API 使用图谱。
 
-## 13. 当前边界
+## 14. 当前边界
 
 当前仍保留以下边界：
 
@@ -525,3 +685,4 @@ POST /api/graph/neighborhood
 - 多版本时间图暂未实现。
 - 查询层权限模型和审计日志尚未细化。
 - 任务/表级 LLM 摘要为可选增强能力，未作为默认流水线强制步骤。
+- Ontology/口径族发现当前为候选层，尚未默认导入正式图谱。

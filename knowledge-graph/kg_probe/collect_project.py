@@ -132,6 +132,7 @@ def collect_upstream_graph(
     sleep_sec: float,
     retries: int = 3,
     backoff_sec: float = 0.5,
+    relation_cache: dict[str, list[dict]] | None = None,
 ) -> dict:
     nodes: dict[str, dict] = {
         root: {
@@ -158,7 +159,12 @@ def collect_upstream_graph(
             break
         expanded.add(task_id)
         try:
-            upstreams = fetch_direct_upstream(api, task_id, retries=retries, backoff_sec=backoff_sec)
+            if relation_cache is not None and task_id in relation_cache:
+                upstreams = relation_cache[task_id]
+            else:
+                upstreams = fetch_direct_upstream(api, task_id, retries=retries, backoff_sec=backoff_sec)
+                if relation_cache is not None:
+                    relation_cache[task_id] = upstreams
         except Exception as exc:  # noqa: BLE001
             errors.append(
                 {

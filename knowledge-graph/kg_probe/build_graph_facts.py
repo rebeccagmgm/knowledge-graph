@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 from datetime import datetime
 from pathlib import Path
 import re
+
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def load(path: Path, default):
@@ -31,6 +34,19 @@ def edge(edge_id: str, from_id: str, to_id: str, rel_type: str, **props) -> dict
         "type": rel_type,
         "properties": clean,
     }
+
+
+def clean_html_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = html.unescape(str(value))
+    return HTML_TAG_RE.sub("", text).strip()
+
+
+def clean_identifier(value: object) -> str:
+    text = clean_html_text(value)
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
+    return text.strip("_").lower()
 
 
 def generated_expression_id(statement_id: str, projection_ordinal: int | str, expression_sql: str) -> str:
@@ -180,6 +196,7 @@ def decorate_facts(
 def owner_ids(raw: str) -> list[str]:
     if not raw:
         return []
+    raw = clean_html_text(raw)
     normalized = raw.replace("，", ",").replace("/", ",").replace("、", ",")
     return [item.strip() for item in normalized.split(",") if item.strip()]
 
@@ -195,17 +212,17 @@ def person_names(raw) -> list[str]:
             if isinstance(item, dict):
                 name = item.get("name") or item.get("userName") or item.get("code")
                 if name:
-                    names.append(str(name))
+                    names.append(clean_html_text(name))
             elif item:
-                names.append(str(item))
+                names.append(clean_html_text(item))
         return names
     return []
 
 
 def code_value(raw) -> str:
     if isinstance(raw, dict):
-        return raw.get("code") or raw.get("name") or raw.get("value") or ""
-    return str(raw) if raw is not None else ""
+        return clean_html_text(raw.get("code") or raw.get("name") or raw.get("value") or "")
+    return clean_html_text(raw) if raw is not None else ""
 
 
 def dataset_layer(dataset: str) -> str:
@@ -473,12 +490,12 @@ def main() -> None:
             name=item["dataset"],
             layer=item.get("layer", ""),
             source_type="sql_parse",
-            comment=dms_exact.get("comment") or dms_exact.get("description", ""),
-            qualified_name=dms_exact.get("qualifiedName", ""),
-            guid=dms_exact.get("guid", ""),
-            db_name=dms_exact.get("dbName", ""),
-            type_name=dms_exact.get("typeName", ""),
-            owner=dms_exact.get("owner", ""),
+            comment=clean_html_text(dms_exact.get("comment") or dms_exact.get("description", "")),
+            qualified_name=clean_html_text(dms_exact.get("qualifiedName", "")),
+            guid=clean_html_text(dms_exact.get("guid", "")),
+            db_name=clean_html_text(dms_exact.get("dbName", "")),
+            type_name=clean_html_text(dms_exact.get("typeName", "")),
+            owner=clean_html_text(dms_exact.get("owner", "")),
             dms_exact_count=dms_item.get("exact_count"),
             dms_total=dms_item.get("total"),
         )
@@ -506,14 +523,16 @@ def main() -> None:
         for column in dms_exact.get("refColumns") or []:
             if not isinstance(column, dict) or not column.get("name"):
                 continue
-            column_name = str(column["name"]).lower()
+            column_name = clean_identifier(column["name"])
+            if not column_name:
+                continue
             column_id = f"column:{item['dataset']}.{column_name}"
             nodes[column_id] = node(
                 column_id,
                 ["Column"],
                 name=column_name,
                 dataset=item["dataset"],
-                comment=column.get("comment", ""),
+                comment=clean_html_text(column.get("comment", "")),
                 source_system="szconnector",
                 source_type="dms_ref_columns",
             )
@@ -527,24 +546,24 @@ def main() -> None:
 
         ind_item = indicators_by_dataset.get(item["dataset"], {})
         for rec in ind_item.get("exact_records") or []:
-            metric_key = rec.get("indexId") or f"{item['dataset']}:{rec.get('englishName') or rec.get('chineseName')}"
+            metric_key = clean_html_text(rec.get("indexId")) or f"{item['dataset']}:{clean_identifier(rec.get('englishName') or rec.get('chineseName'))}"
             metric_id = f"metric:{metric_key}"
             nodes[metric_id] = node(
                 metric_id,
                 ["Metric"],
-                metric_id=rec.get("indexId", ""),
-                chinese_name=rec.get("chineseName") or rec.get("abbreviation", ""),
-                abbreviation=rec.get("abbreviation", ""),
-                english_name=rec.get("englishName", ""),
+                metric_id=clean_html_text(rec.get("indexId", "")),
+                chinese_name=clean_html_text(rec.get("chineseName") or rec.get("abbreviation", "")),
+                abbreviation=clean_html_text(rec.get("abbreviation", "")),
+                english_name=clean_html_text(rec.get("englishName", "")),
                 dataset=item["dataset"],
                 index_type=code_value(rec.get("indexType")),
                 index_gran=code_value(rec.get("indexGran")),
                 release_status=code_value(rec.get("releaseStatus")),
-                business_cycle=rec.get("busiCyc", ""),
-                horae_task_id=rec.get("horaeTaskId", ""),
-                version_no=rec.get("versionNo", ""),
-                create_time=rec.get("createTime", ""),
-                update_time=rec.get("lastUpdateTime", ""),
+                business_cycle=clean_html_text(rec.get("busiCyc", "")),
+                horae_task_id=clean_html_text(rec.get("horaeTaskId", "")),
+                version_no=clean_html_text(rec.get("versionNo", "")),
+                create_time=clean_html_text(rec.get("createTime", "")),
+                update_time=clean_html_text(rec.get("lastUpdateTime", "")),
                 source_system="szconnector",
             )
             edges[f"{metric_id}->STORED_IN->{dataset_id}"] = edge(
@@ -566,12 +585,12 @@ def main() -> None:
                         source_system="szconnector",
                     )
 
-            definition = rec.get("businessDefinition") or ""
+            definition = clean_html_text(rec.get("businessDefinition") or "")
             definition_id = f"metric_definition:{metric_key}"
             nodes[definition_id] = node(
                 definition_id,
                 ["MetricDefinition"],
-                metric_id=rec.get("indexId", ""),
+                metric_id=clean_html_text(rec.get("indexId", "")),
                 definition=definition,
                 source_system="szconnector",
                 source_type="indicator_registry",

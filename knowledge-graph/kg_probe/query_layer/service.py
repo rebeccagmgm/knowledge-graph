@@ -1360,6 +1360,78 @@ class QueryService:
             "influence_type": props.get("influence_type"),
         }
 
+    def _neighborhood_step(
+        self,
+        frontier: set[str],
+        relation_types: list[str],
+        direction: str,
+        project_id: str,
+        limit: int,
+    ) -> list[dict]:
+        if not frontier or limit <= 0:
+            return []
+        relations = "|".join(relation_types)
+        params = {"project_id": project_id, "frontier": sorted(frontier), "limit": limit}
+        rows: list[dict] = []
+        if direction in {"upstream", "both"}:
+            rows.extend(
+                self.store.query(
+                    f"""
+                    MATCH (current:KGNode {{project_key: $project_id}})
+                    WHERE current.id IN $frontier
+                    MATCH (current)-[r:{relations}]->(neighbor:KGNode {{project_key: $project_id}})
+                    RETURN current, neighbor, r, 'out' AS traversal
+                    ORDER BY type(r), neighbor.id
+                    LIMIT $limit
+                    """,
+                    params,
+                )
+            )
+        if direction in {"downstream", "both"}:
+            rows.extend(
+                self.store.query(
+                    f"""
+                    MATCH (current:KGNode {{project_key: $project_id}})
+                    WHERE current.id IN $frontier
+                    MATCH (neighbor:KGNode {{project_key: $project_id}})-[r:{relations}]->(current)
+                    RETURN current, neighbor, r, 'in' AS traversal
+                    ORDER BY type(r), neighbor.id
+                    LIMIT $limit
+                    """,
+                    params,
+                )
+            )
+        deduped = {}
+        for row in rows:
+            edge = row.get("r") or {}
+            current = row.get("current") or {}
+            neighbor = row.get("neighbor") or {}
+            key = (current.get("id"), neighbor.get("id"), edge.get("id"), row.get("traversal"))
+            deduped.setdefault(key, row)
+        return list(deduped.values())[:limit]
+
+    def _edge_path_payload(self, edge: dict, source: str, target: str, direction: str) -> dict:
+        raw = json.dumps([source, target, edge.get("id"), edge.get("type")], ensure_ascii=False)
+        props = edge.get("properties", {})
+        return {
+            "path_id": f"path_{hashlib.sha256(raw.encode()).hexdigest()[:16]}",
+            "direction": direction,
+            "hop_count": 1,
+            "confidence": props.get("confidence", "medium"),
+            "nodes": [source, target],
+            "edges": [{
+                "type": edge.get("type"),
+                "from": edge.get("from"),
+                "to": edge.get("to"),
+                "confidence": props.get("confidence", "medium"),
+                "inferred": props.get("inferred", False),
+                "task_id": props.get("task_id"),
+                "statement_id": props.get("statement_id"),
+                "source_type": props.get("source_type"),
+                "influence_type": props.get("influence_type"),
+            }],
+        }
+
     def get_graph_neighborhood(self, req: dict) -> dict:
         node, candidates = self._resolve_subject(req)
         if not node:
@@ -1368,31 +1440,9 @@ class QueryService:
         if direction not in {"upstream", "downstream", "both"}:
             raise ValueError("direction must be upstream, downstream, or both")
         relation_types, profile = self._graph_relation_types(req)
-        relations = "|".join(relation_types)
         hops = min(req["max_hops"], int(req.get("visual_max_hops", 8)))
         limit_nodes = min(max(1, int(req.get("limit_nodes", req["limit"]))), 500)
         limit_edges = min(max(1, int(req.get("limit_edges", limit_nodes * 3))), 1500)
-        path_limit = min(max(limit_edges, limit_nodes * 3), 2000)
-        if direction == "upstream":
-            pattern = f"(center)-[:{relations}*1..{hops}]->(n:KGNode)"
-        elif direction == "downstream":
-            pattern = f"(center)<-[:{relations}*1..{hops}]-(n:KGNode)"
-        else:
-            pattern = f"(center)-[:{relations}*1..{hops}]-(n:KGNode)"
-        rows = self.store.query(
-            f"""
-            MATCH (center:KGNode {{id: $id, project_key: $project_id}})
-            OPTIONAL MATCH p={pattern}
-            WHERE p IS NULL OR all(x IN nodes(p) WHERE x.project_key = $project_id)
-            RETURN center, p
-            ORDER BY CASE WHEN p IS NULL THEN 0 ELSE length(p) END, n.id
-            LIMIT $path_limit
-            """,
-            {"id": node["id"], "project_id": req["project_id"], "path_limit": path_limit},
-        )
-        if not rows:
-            return response("get_graph_neighborhood", status="not_found", answer="未找到目标实体。")
-
         visual_nodes: dict[str, dict] = {node["id"]: self._visual_node(node, 0, req["include_properties"])}
         visual_edges: dict[tuple[str, str, str, str], dict] = {}
         entities = [entity_ref(node, req["include_properties"])]
@@ -1400,49 +1450,69 @@ class QueryService:
         paths = []
         source_path_count = 0
         truncated = False
-        for row in rows:
-            path_obj = row.get("p")
-            if not path_obj:
-                continue
-            source_path_count += 1
-            path_payload, path_entities, path_evidence = self._path_payload(path_obj, direction, req["include_properties"])
-            paths.append(path_payload)
-            entities.extend(path_entities)
-            evidence.extend(path_evidence)
-            path_nodes = path_obj.get("nodes", [])
-            path_edges = path_obj.get("edges", [])
-            for depth, path_node in enumerate(path_nodes):
-                path_node_id = path_node.get("id")
-                if len(visual_nodes) >= limit_nodes and path_node_id not in visual_nodes:
-                    truncated = True
+        visited = {node["id"]}
+        frontier = {node["id"]}
+        per_step_limit = min(max(limit_edges, limit_nodes * 2), 500)
+        for depth in range(1, hops + 1):
+            if not frontier or len(visual_edges) >= limit_edges or len(visual_nodes) >= limit_nodes:
+                break
+            remaining_edges = limit_edges - len(visual_edges)
+            rows = self._neighborhood_step(
+                frontier,
+                relation_types,
+                direction,
+                req["project_id"],
+                min(per_step_limit, remaining_edges),
+            )
+            if not rows:
+                break
+            next_frontier = set()
+            for row in rows:
+                edge = row.get("r") or {}
+                current = row.get("current") or {}
+                neighbor = row.get("neighbor") or {}
+                current_id = current.get("id")
+                neighbor_id = neighbor.get("id")
+                if not current_id or not neighbor_id:
                     continue
-                old = visual_nodes.get(path_node_id)
-                if old:
-                    old["depth"] = min(old["depth"], depth)
-                elif path_node_id:
-                    visual_nodes[path_node_id] = self._visual_node(path_node, depth, req["include_properties"])
-            for idx, edge in enumerate(path_edges):
                 if len(visual_edges) >= limit_edges:
                     truncated = True
-                    continue
-                if idx + 1 >= len(path_nodes):
-                    continue
-                source = path_nodes[idx].get("id")
-                target = path_nodes[idx + 1].get("id")
-                if source not in visual_nodes or target not in visual_nodes:
-                    truncated = True
-                    continue
+                    break
+                if current_id not in visual_nodes:
+                    if len(visual_nodes) >= limit_nodes:
+                        truncated = True
+                        continue
+                    visual_nodes[current_id] = self._visual_node(current, depth - 1, req["include_properties"])
+                    entities.append(entity_ref(current, req["include_properties"]))
+                if neighbor_id not in visual_nodes:
+                    if len(visual_nodes) >= limit_nodes:
+                        truncated = True
+                        continue
+                    visual_nodes[neighbor_id] = self._visual_node(neighbor, depth, req["include_properties"])
+                    entities.append(entity_ref(neighbor, req["include_properties"]))
+                else:
+                    visual_nodes[neighbor_id]["depth"] = min(visual_nodes[neighbor_id]["depth"], depth)
+                source = current_id
+                target = neighbor_id
                 key = (source, target, edge.get("type"), edge.get("id"))
-                visual_edges.setdefault(key, self._visual_edge(edge, source, target))
-        if source_path_count >= path_limit:
-            truncated = True
+                if key not in visual_edges:
+                    visual_edges[key] = self._visual_edge(edge, source, target)
+                    source_path_count += 1
+                    paths.append(self._edge_path_payload(edge, source, target, direction))
+                    evidence.append(self._edge_evidence(edge))
+                if neighbor_id not in visited:
+                    next_frontier.add(neighbor_id)
+            visited.update(next_frontier)
+            frontier = next_frontier
+            if len(rows) >= min(per_step_limit, remaining_edges):
+                truncated = True
         status = "partial" if truncated else "ok"
         warns = []
         if hops < req["max_hops"]:
             warns.append(warning("MAX_HOPS_CAPPED", f"局部图展示深度已从{req['max_hops']}限制为{hops}。"))
             status = "partial"
         if truncated:
-            warns.append(warning("RESULT_TRUNCATED", "局部图节点、边或路径达到返回上限，结果已截断。"))
+            warns.append(warning("RESULT_TRUNCATED", "局部图按层展开时达到节点或关系上限，结果已截断。"))
         if not visual_edges:
             status = "partial"
             warns.append(warning("NEIGHBORHOOD_EMPTY", "目标实体在当前关系范围内没有展开到邻接关系。", related_entity_ids=[node["id"]]))

@@ -206,6 +206,11 @@ def table_aliases(parsed: exp.Expression) -> dict[str, str]:
     for table in parsed.find_all(exp.Table):
         name = table_name(table)
         if name.split(".")[-1] in cte_names:
+            alias = table.alias_or_name
+            cte_name = name.split(".")[-1]
+            if alias:
+                aliases[alias.lower()] = cte_name
+            aliases[cte_name] = cte_name
             continue
         alias = table.alias_or_name
         if alias:
@@ -226,6 +231,8 @@ def table_aliases(parsed: exp.Expression) -> dict[str, str]:
                 unique_tables.append(name)
         if len(unique_tables) == 1:
             aliases[alias.lower()] = unique_tables[0]
+        else:
+            aliases[alias.lower()] = alias.lower()
     return aliases
 
 
@@ -265,6 +272,35 @@ def output_name(expr: exp.Expression) -> str:
     return ""
 
 
+def nearest_select(expr: exp.Expression) -> exp.Select | None:
+    node = getattr(expr, "parent", None)
+    while node is not None:
+        if isinstance(node, exp.Select):
+            return node
+        node = getattr(node, "parent", None)
+    return None
+
+
+def relation_aliases(select: exp.Select | None) -> list[str]:
+    if select is None:
+        return []
+    aliases = []
+    from_expr = select.args.get("from_")
+    relations = []
+    if from_expr is not None and isinstance(from_expr.this, exp.Expression):
+        relations.append(from_expr.this)
+    for join in select.args.get("joins") or []:
+        if isinstance(join.this, exp.Expression):
+            relations.append(join.this)
+    for relation in relations:
+        alias = relation.alias_or_name
+        if alias:
+            value = alias.lower()
+            if value not in aliases:
+                aliases.append(value)
+    return aliases
+
+
 def expression_kind(expr: exp.Expression) -> str:
     if isinstance(expr, exp.Alias):
         return expression_kind(expr.this)
@@ -277,6 +313,14 @@ def expression_kind(expr: exp.Expression) -> str:
     if list(expr.find_all(exp.Column)):
         return "source_expression"
     return "generated_expression"
+
+
+def prefixed_confidence(prefix: str, confidence: object) -> str:
+    value = str(confidence or "unknown")
+    for known_prefix in ("cte_star_", "cte_"):
+        while value.startswith(known_prefix):
+            value = value[len(known_prefix) :]
+    return f"{prefix}{value}"
 
 
 def resolve_direct_column(
@@ -331,9 +375,65 @@ def source_columns(
         if not col_name:
             continue
         table = (col.table or "").lower()
-        if table in cte_column_sources and col_name in cte_column_sources[table]:
-            for source in cte_column_sources[table][col_name]:
-                sources.append({**source, "confidence": f"cte_{source['confidence']}"})
+        cte_key = ""
+        if table in cte_column_sources:
+            cte_key = table
+        elif table and aliases.get(table, "") in cte_column_sources:
+            cte_key = aliases[table]
+        elif not table:
+            select_aliases = relation_aliases(nearest_select(col))
+            scoped_candidates = []
+            for alias in select_aliases:
+                alias_value = aliases.get(alias, alias)
+                if alias_value in cte_column_sources and col_name in cte_column_sources[alias_value]:
+                    scoped_candidates.append(alias_value)
+            if len(scoped_candidates) == 1:
+                cte_key = scoped_candidates[0]
+            if not cte_key:
+                physical_candidates = []
+                for alias in select_aliases:
+                    dataset = aliases.get(alias, "")
+                    if "." in dataset:
+                        dataset = best_dataset_match(dataset, columns_by_dataset)
+                        if col_name in set(columns_by_dataset.get(dataset, [])):
+                            physical_candidates.append(dataset)
+                unique_physical = []
+                for candidate in physical_candidates:
+                    if candidate not in unique_physical:
+                        unique_physical.append(candidate)
+                if len(unique_physical) == 1:
+                    dataset = unique_physical[0]
+                    sources.append(
+                        {
+                            "dataset": dataset,
+                            "column": col_name,
+                            "column_id": column_id(dataset, col_name),
+                            "confidence": "scoped_single_relation",
+                        }
+                    )
+                    continue
+        if not cte_key and not table:
+            cte_candidates = []
+            for alias_value in aliases.values():
+                if alias_value in cte_column_sources and col_name in cte_column_sources[alias_value]:
+                    cte_candidates.append(alias_value)
+            unique_candidates = []
+            for candidate in cte_candidates:
+                if candidate not in unique_candidates:
+                    unique_candidates.append(candidate)
+            if len(unique_candidates) == 1:
+                cte_key = unique_candidates[0]
+            elif not unique_candidates:
+                direct_candidates = [
+                    name
+                    for name, column_map in cte_column_sources.items()
+                    if col_name in column_map
+                ]
+                if len(direct_candidates) == 1:
+                    cte_key = direct_candidates[0]
+        if cte_key and col_name in cte_column_sources[cte_key]:
+            for source in cte_column_sources[cte_key][col_name]:
+                sources.append({**source, "confidence": prefixed_confidence("cte_", source["confidence"])})
             continue
         sources.append(resolve_direct_column(col_name, table, aliases, read_datasets, columns_by_dataset))
     unique = {}
@@ -443,15 +543,16 @@ def star_sources(
 
     datasets: list[str] = []
     if table:
-        if table in cte_column_sources:
+        cte_key = table if table in cte_column_sources else aliases.get(table, "")
+        if cte_key in cte_column_sources:
             expanded = []
-            for column_name, sources in cte_column_sources[table].items():
+            for column_name, sources in cte_column_sources[cte_key].items():
                 for source in sources:
                     expanded.append(
                         {
                             **source,
                             "output_column": column_name,
-                            "confidence": f"cte_star_{source['confidence']}",
+                            "confidence": prefixed_confidence("cte_star_", source["confidence"]),
                         }
                     )
             return expanded
@@ -537,21 +638,39 @@ def build_cte_column_sources(
     columns_by_dataset: dict[str, list[str]],
 ) -> dict[str, dict[str, list[dict]]]:
     result: dict[str, dict[str, list[dict]]] = {}
-    for cte in parsed.find_all(exp.CTE):
-        cte_name = cte.alias_or_name.lower()
-        select = cte.this.find(exp.Select) if cte.this else None
-        if not select:
-            continue
-        aliases = table_aliases(cte.this)
-        cte_map: dict[str, list[dict]] = {}
-        for projection in select.expressions:
-            items, error = projection_facts(projection, aliases, read_datasets, columns_by_dataset, result)
-            if error:
+    for _ in range(4):
+        changed = False
+        for container_name, container_expr in [
+            *[(cte.alias_or_name.lower(), cte.this) for cte in parsed.find_all(exp.CTE) if cte.alias_or_name],
+            *[
+                (subquery.alias_or_name.lower(), subquery.this)
+                for subquery in parsed.find_all(exp.Subquery)
+                if subquery.alias_or_name
+            ],
+        ]:
+            selects = select_queries(container_expr) if container_expr else []
+            if not selects:
                 continue
-            for out_col, sources in items:
-                cte_map[out_col] = sources
-        if cte_map:
-            result[cte_name] = cte_map
+            aliases = table_aliases(container_expr)
+            column_map: dict[str, list[dict]] = {}
+            for select in selects:
+                for projection in select.expressions:
+                    items, error = projection_facts(projection, aliases, read_datasets, columns_by_dataset, result)
+                    if error:
+                        continue
+                    for out_col, sources in items:
+                        existing = column_map.setdefault(out_col, [])
+                        seen = {(item.get("dataset"), item.get("column"), item.get("confidence")) for item in existing}
+                        for source in sources:
+                            key = (source.get("dataset"), source.get("column"), source.get("confidence"))
+                            if key not in seen:
+                                existing.append(source)
+                                seen.add(key)
+            if column_map and column_map != result.get(container_name):
+                result[container_name] = column_map
+                changed = True
+        if not changed:
+            break
     return result
 
 
