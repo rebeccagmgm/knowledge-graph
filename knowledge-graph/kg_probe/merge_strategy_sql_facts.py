@@ -17,11 +17,11 @@ from pathlib import Path
 def load(path: Path, default):
     if not path.exists():
         return default
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write(path: Path, data) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def layer_of(dataset: str) -> str:

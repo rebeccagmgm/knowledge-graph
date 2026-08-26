@@ -97,7 +97,7 @@ def main() -> None:
 
     project_dir = Path(args.project_dir)
     out = project_dir / f"{args.prefix}_query_templates.cypher"
-    out.write_text(TEMPLATE)
+    out.write_text(TEMPLATE, encoding="utf-8")
     print(json.dumps({"query_templates_path": str(out), "line_count": len(TEMPLATE.splitlines())}, ensure_ascii=False))
 
 

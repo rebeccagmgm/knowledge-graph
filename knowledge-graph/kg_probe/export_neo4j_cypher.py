@@ -77,7 +77,7 @@ def main() -> None:
 
     lines = [*SCHEMA_LINES, ""]
 
-    for raw in nodes_path.read_text().splitlines():
+    for raw in nodes_path.read_text(encoding="utf-8").splitlines():
         if not raw.strip():
             continue
         item = json.loads(raw)
@@ -87,7 +87,7 @@ def main() -> None:
         lines.append(f"SET n{labels_literal(labels)}, n += {props_literal(props)};")
 
     lines.append("")
-    for raw in edges_path.read_text().splitlines():
+    for raw in edges_path.read_text(encoding="utf-8").splitlines():
         if not raw.strip():
             continue
         item = json.loads(raw)
@@ -102,7 +102,7 @@ def main() -> None:
         lines.append(f"MERGE (a)-[r:{rel_type} {{id: {cypher_value(item['id'])}}}]->(b)")
         lines.append(f"SET r += {props_literal(props)};")
 
-    out_path.write_text("\n".join(lines) + "\n")
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(json.dumps({"cypher_path": str(out_path), "line_count": len(lines)}, ensure_ascii=False))
 
 

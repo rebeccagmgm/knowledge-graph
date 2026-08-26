@@ -68,7 +68,7 @@ def best_dataset_match(dataset: str, columns_by_dataset: dict[str, list[str]]) -
 def load(path: Path, default):
     if not path.exists():
         return default
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def resolve_statement_path(project_dir: Path, statement_path: str, statement_id: str) -> Path:
@@ -145,7 +145,7 @@ def graph_task_outputs(project_dir: Path, prefix: str) -> dict[str, set[str]]:
     outputs: dict[str, set[str]] = defaultdict(set)
     if not path.exists():
         return outputs
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         edge = json.loads(line)
@@ -963,10 +963,10 @@ def main() -> None:
     influence_path = project_dir / f"{args.prefix}_column_influence.json"
     errors_path = project_dir / f"{args.prefix}_column_lineage_errors.json"
     skipped_path = project_dir / f"{args.prefix}_column_lineage_skipped.json"
-    facts_path.write_text(json.dumps(all_facts, ensure_ascii=False, indent=2))
-    influence_path.write_text(json.dumps(all_influence_facts, ensure_ascii=False, indent=2))
-    errors_path.write_text(json.dumps(all_errors, ensure_ascii=False, indent=2))
-    skipped_path.write_text(json.dumps(all_skipped, ensure_ascii=False, indent=2))
+    facts_path.write_text(json.dumps(all_facts, ensure_ascii=False, indent=2), encoding="utf-8")
+    influence_path.write_text(json.dumps(all_influence_facts, ensure_ascii=False, indent=2), encoding="utf-8")
+    errors_path.write_text(json.dumps(all_errors, ensure_ascii=False, indent=2), encoding="utf-8")
+    skipped_path.write_text(json.dumps(all_skipped, ensure_ascii=False, indent=2), encoding="utf-8")
     summary = {
         "statement_count": len(statements),
         "column_lineage_count": len(all_facts),
@@ -999,7 +999,7 @@ def main() -> None:
         "skipped_path": str(skipped_path),
     }
     (project_dir / f"{args.prefix}_column_lineage_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2)
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False))
 

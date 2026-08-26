@@ -42,7 +42,7 @@ def main() -> None:
 
     project_dir = Path(args.project_dir)
     out = project_dir / f"{args.prefix}_neo4j_schema.cypher"
-    out.write_text(SCHEMA_CYPHER)
+    out.write_text(SCHEMA_CYPHER, encoding="utf-8")
     print(json.dumps({"schema_path": str(out), "line_count": len(SCHEMA_CYPHER.splitlines())}, ensure_ascii=False))
 
 

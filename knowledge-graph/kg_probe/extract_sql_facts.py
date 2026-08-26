@@ -222,7 +222,7 @@ def write_statement_file(output_dir: Path, statement_id: str, sql: str) -> str:
     sql_dir = output_dir / "sql"
     sql_dir.mkdir(parents=True, exist_ok=True)
     path = sql_dir / f"{statement_id}.sql"
-    path.write_text(sql)
+    path.write_text(sql, encoding="utf-8")
     return str(path)
 
 
@@ -308,7 +308,7 @@ def extract_project(project_dir: Path, dialect: str, log_artifacts_file: str) ->
     if not log_artifacts_path.exists():
         raise SystemExit(f"Missing {log_artifacts_path}")
 
-    log_artifacts = json.loads(log_artifacts_path.read_text())
+    log_artifacts = json.loads(log_artifacts_path.read_text(encoding="utf-8"))
     prepare_targets = page_prepare_targets(log_artifacts, dialect)
     statements = []
     datasets = {}
@@ -320,7 +320,7 @@ def extract_project(project_dir: Path, dialect: str, log_artifacts_file: str) ->
         if not log_path.exists():
             errors.append({"task_id": artifact["task_id"], "error": f"missing log {log_path}"})
             continue
-        text = log_path.read_text(errors="ignore")
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
         is_page_artifact = str(artifact.get("source_type", "")).startswith("task_page")
         candidates = extract_page_sql(text) if is_page_artifact else extract_candidate_sql(text)
         for index, sql in enumerate(candidates, start=1):
@@ -435,7 +435,7 @@ def extract_project(project_dir: Path, dialect: str, log_artifacts_file: str) ->
 
 
 def write_json(path: Path, data) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> None:

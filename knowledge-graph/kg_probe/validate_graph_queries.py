@@ -13,7 +13,7 @@ def load_jsonl(path: Path) -> list[dict]:
     items = []
     if not path.exists():
         return items
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
             items.append(json.loads(line))
     return items
@@ -234,7 +234,7 @@ def main() -> None:
     project_dir = Path(args.project_dir)
     report = validate(project_dir, args.prefix, args.sample_limit, args.path_limit, args.max_depth)
     out = project_dir / f"{args.prefix}_graph_query_validation.json"
-    out.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     compact = {
         "output": str(out),

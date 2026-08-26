@@ -29,7 +29,7 @@ REQUIRED_EDGE_PROPS = {
 
 def load_jsonl(path: Path) -> list[dict]:
     rows = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
             rows.append(json.loads(line))
     return rows
@@ -145,7 +145,7 @@ def main() -> None:
     project_dir = Path(args.project_dir)
     result = audit(project_dir, args.prefix)
     out = project_dir / f"{args.prefix}_fact_audit.json"
-    out.write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"audit_path": str(out), **result}, ensure_ascii=False))
 
 

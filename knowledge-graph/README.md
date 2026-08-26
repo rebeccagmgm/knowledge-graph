@@ -132,6 +132,16 @@ python3 /Applications/personal-work/kg_probe/run_pipeline.py 238758
 
 更多节点、边和置信度规则见 `GRAPH_MODEL.md`。
 
+## 从 Input Pack 做静态冒烟
+
+如果已有 `sql-static-lineage` 的 Input Pack，可以离线生成本项目需要的静态中间产物和 JSONL 图谱：
+
+```powershell
+python -X utf8 kg_probe/input_pack_adapter.py "E:\02_area\股衍数据-数据cookbook\sql-static-lineage-data" artifacts/input-pack-smoke --project-id input_pack_smoke --task-ids 103198 --build-graph
+```
+
+该入口只消费 Task Pack 的 canonical SQL、Task target 和相关 Table Pack/DDL。它不会补造 Horae 调度边、运行日志、任务执行成功或业务正确性；生成的 `strategy_graph_nodes.jsonl` 和 `strategy_graph_edges.jsonl` 是静态证据图。
+
 增量更新说明见 `INCREMENTAL_UPDATE.md`。
 
 接口调用说明见 `QUERY_API_USAGE.md`。

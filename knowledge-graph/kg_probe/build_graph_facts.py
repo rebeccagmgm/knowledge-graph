@@ -17,7 +17,7 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 def load(path: Path, default):
     if not path.exists():
         return default
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def node(node_id: str, labels: list[str], **props) -> dict:
@@ -304,8 +304,13 @@ def infer_task_datasets(task_node: dict, detail: dict) -> tuple[set[str], set[st
     consumes: set[str] = set()
     is_hive_to_external = task_type.startswith("hive2")
 
-    if is_dataset_name(task_name) and not is_hive_to_external:
+    if detail.get("source_system") != "input_pack" and is_dataset_name(task_name) and not is_hive_to_external:
         produces.add(task_name.lower())
+
+    if detail.get("source_system") == "input_pack":
+        target = (detail.get("target") or "").strip()
+        if is_dataset_name(target):
+            produces.add(target.lower())
 
     hive_db = (sync_info.get("Hive源库") or "").strip()
     hive_table = (sync_info.get("Hive源表") or "").strip()
@@ -434,18 +439,24 @@ def main() -> None:
                 task_node_id,
                 dataset_id,
                 "CONSUMES",
-                source_system="horae",
-                source_type="task_detail_sync_info",
+                source_system=detail.get("source_system", "horae"),
+                source_type=(
+                    "input_pack_task_source"
+                    if detail.get("source_system") == "input_pack"
+                    else "task_detail_sync_info"
+                ),
             )
         for dataset in sorted(produces):
-            dataset_id = add_dataset_node(nodes, edges, dataset, source_type="task_detail_sync_info")
+            source_system = detail.get("source_system", "horae")
+            source_type = "input_pack_task_target" if source_system == "input_pack" else "task_detail_sync_info"
+            dataset_id = add_dataset_node(nodes, edges, dataset, source_type=source_type)
             edges[f"{task_node_id}->PRODUCES->{dataset_id}"] = edge(
                 f"{task_node_id}->PRODUCES->{dataset_id}",
                 task_node_id,
                 dataset_id,
                 "PRODUCES",
-                source_system="horae",
-                source_type="task_detail_sync_info",
+                source_system=source_system,
+                source_type=source_type,
             )
 
         log_info = logs_by_task.get(task_id)
@@ -628,6 +639,7 @@ def main() -> None:
             statement_id=sid,
             task_id=item.get("task_id"),
             statement_path=item.get("statement_path"),
+            source_sql_path=item.get("source_sql_path"),
             source_log_path=item.get("source_log_path"),
             parse_ok=item.get("parse_ok"),
             extraction_method=item.get("extraction_method"),
@@ -851,8 +863,14 @@ def main() -> None:
 
     nodes_path = base / f"{args.prefix}_graph_nodes.jsonl"
     edges_path = base / f"{args.prefix}_graph_edges.jsonl"
-    nodes_path.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in nodes.values()) + "\n")
-    edges_path.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in edges.values()) + "\n")
+    nodes_path.write_text(
+        "\n".join(json.dumps(item, ensure_ascii=False) for item in nodes.values()) + "\n",
+        encoding="utf-8",
+    )
+    edges_path.write_text(
+        "\n".join(json.dumps(item, ensure_ascii=False) for item in edges.values()) + "\n",
+        encoding="utf-8",
+    )
 
     summary = {
         "nodes_path": str(nodes_path),
@@ -875,7 +893,10 @@ def main() -> None:
         summary["edge_type_distribution"][item["type"]] = summary["edge_type_distribution"].get(item["type"], 0) + 1
         confidence = item.get("properties", {}).get("confidence", "unknown")
         summary["edge_confidence_distribution"][confidence] = summary["edge_confidence_distribution"].get(confidence, 0) + 1
-    (base / f"{args.prefix}_graph_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+    (base / f"{args.prefix}_graph_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     print(json.dumps(summary, ensure_ascii=False))
 
 

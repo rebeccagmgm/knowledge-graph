@@ -12,7 +12,7 @@ from pathlib import Path
 def load(path: Path, default):
     if not path.exists():
         return default
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def pct(numerator: int, denominator: int) -> float:
@@ -71,7 +71,7 @@ def main() -> None:
     graph_dm_index_n_count = 0
     graph_nodes_path = base / f"{args.prefix}_graph_nodes.jsonl"
     if graph_nodes_path.exists():
-        for line in graph_nodes_path.read_text().splitlines():
+        for line in graph_nodes_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             item = json.loads(line)
@@ -251,7 +251,7 @@ def main() -> None:
         },
     }
     out = base / f"{args.prefix}_quality_report.json"
-    out.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False))
 
 
