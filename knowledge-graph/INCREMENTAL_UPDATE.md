@@ -12,6 +12,7 @@
 - `scan_interval_hours`：扫描间隔，默认48小时。
 - `build_llm`：变化后是否重新运行LLM口径层，默认关闭。
 - `import_neo4j`：重建成功后是否导入Neo4j，默认关闭。
+- `options.force_lineage_refresh`：是否每轮强制重新拉取根任务上游血缘，默认`true`。设为`false`时会复用已有根任务血缘文件，只补缺失文件；适合快速验证后续采集、快照比对和重建链路，但无法发现新的上游依赖变化。
 
 实际登记文件默认位置：
 
@@ -46,6 +47,15 @@ python3 /Applications/personal-work/kg_probe/incremental_update.py --all
 ```
 
 建议定时器每天调用一次`--all`。扫描器会根据各项目的`scan_interval_hours`判断是否到期，因此默认每48小时真正访问一次Horae。
+
+运行时会向stderr输出结构化进度事件，例如：
+
+```json
+{"event":"step_started","step":"refresh_lineage", "...":"..."}
+{"event":"step_finished","step":"refresh_lineage","returncode":0,"elapsed_seconds":123.456}
+```
+
+这些事件用于观察长扫描所处阶段，不影响stdout最终JSON结果。
 
 只检测、不触发重建：
 

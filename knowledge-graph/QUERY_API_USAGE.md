@@ -77,7 +77,49 @@ Content-Type: application/json
 | `not_found` | 未找到匹配实体 |
 | `error` | 查询失败 |
 
-## 3. 搜索实体
+## 3. 辅助接口
+
+### 3.1 健康检查
+
+接口：
+
+```text
+GET {BASE_URL}/health
+```
+
+用于确认查询服务和 Neo4j 连接是否可用。
+
+### 3.2 查询已导入项目
+
+接口：
+
+```text
+GET {BASE_URL}/api/projects
+```
+
+返回已导入 Neo4j 的项目列表，以及每个项目的节点数、边数、任务数和指标数。
+
+### 3.3 查询项目图谱状态
+
+接口：
+
+```text
+GET {BASE_URL}/api/projects/{project_id}/graph-status
+```
+
+用于查看某个项目的图谱前缀、构建批次、构建时间和增量扫描状态。
+
+### 3.4 查询接口原语映射
+
+接口：
+
+```text
+GET {BASE_URL}/api/primitives
+```
+
+用于查看 HTTP 友好路径和底层查询原语的映射关系。
+
+## 4. 搜索实体
 
 用于搜索指标、任务、表、字段。
 
@@ -106,7 +148,7 @@ curl -s -X POST {BASE_URL}/api/entities/search \
 metric, schedule_task, dataset, column, sql_statement
 ```
 
-## 4. 解析实体
+## 5. 解析实体
 
 用于将用户输入的关键词、任务 ID、表名、字段名、指标 ID 解析为图谱中的确定实体。机器人在执行上下文查询、血缘查询、影响分析前，可以先调用该接口做实体消歧。
 
@@ -142,7 +184,7 @@ curl -s -X POST {BASE_URL}/api/query/resolve_entity \
 
 如果返回 `status=ambiguous`，说明存在多个候选实体，需要用户补充表名、任务 ID 或指标 ID。
 
-## 5. 影响分析
+## 6. 影响分析
 
 用于分析字段、表、任务变更会影响哪些下游字段、表、任务、指标。
 
@@ -186,7 +228,7 @@ drop, rename, type_change, logic_change, stop_production, schedule_change
 | `paths` | 代表性血缘路径 |
 | `evidence` | 支撑证据 |
 
-## 6. 查询口径差异
+## 7. 查询口径差异
 
 用于查询登记口径与代码口径、LLM 理解口径不一致的指标。
 
@@ -230,7 +272,7 @@ curl -s -X POST {BASE_URL}/api/definitions/issues \
 | `data.issues[].conflict_points` | 冲突点 |
 | `data.issues[].recommended_definition` | 建议口径 |
 
-## 7. 比对单个指标口径
+## 8. 比对单个指标口径
 
 用于查询某一个指标的登记口径、代码口径和 LLM 比对结论。它更适合回答“这个指标的登记口径和代码口径是否一致”。
 
@@ -271,7 +313,7 @@ curl -s -X POST {BASE_URL}/api/metrics/definition-compare \
 | `data.comparisons` | 差异点、缺失点和建议口径 |
 | `evidence` | 支撑代码、SQL、表、任务证据 |
 
-## 8. 查询指标上下文
+## 9. 查询指标上下文
 
 用于查询某个指标的登记口径、代码口径、存储表、计算任务和证据。
 
@@ -302,7 +344,7 @@ curl -s -X POST {BASE_URL}/api/metrics/context \
 }
 ```
 
-## 9. 查询任务上下文
+## 10. 查询任务上下文
 
 用于查询任务元信息、读写表、上下游任务、SQL 证据。
 
@@ -323,7 +365,7 @@ curl -s -X POST {BASE_URL}/api/tasks/context \
   }'
 ```
 
-## 10. 查询表上下文
+## 11. 查询表上下文
 
 用于查询表的层级、字段、上下游表、生产任务、消费任务。
 
@@ -344,7 +386,7 @@ curl -s -X POST {BASE_URL}/api/datasets/context \
   }'
 ```
 
-## 11. 查询字段上下文
+## 12. 查询字段上下文
 
 用于查询字段所属表、字段血缘、影响路径和证据。
 
@@ -366,7 +408,7 @@ curl -s -X POST {BASE_URL}/api/columns/context \
   }'
 ```
 
-## 12. 查询上游血缘
+## 13. 查询上游血缘
 
 接口：
 
@@ -390,7 +432,7 @@ curl -s -X POST {BASE_URL}/api/lineage/upstream \
   }'
 ```
 
-## 13. 查询下游血缘
+## 14. 查询下游血缘
 
 接口：
 
@@ -412,7 +454,7 @@ curl -s -X POST {BASE_URL}/api/lineage/downstream \
   }'
 ```
 
-## 14. 解释两点之间的血缘路径
+## 15. 解释两点之间的血缘路径
 
 用于解释两个实体之间是否存在可解释路径。
 
@@ -435,7 +477,97 @@ curl -s -X POST {BASE_URL}/api/path/explain \
   }'
 ```
 
-## 15. 分页查询
+## 16. 查询增量变化事件
+
+用于查询项目最近的增量扫描结果，包括任务新增删除、代码语义变化、依赖变化、表结构变化、指标登记变化和受影响任务/指标摘要。
+
+接口：
+
+```text
+POST {BASE_URL}/api/changes/recent
+```
+
+请求示例：
+
+```bash
+curl -s -X POST {BASE_URL}/api/changes/recent \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "project_id": "sale",
+    "limit": 10
+  }'
+```
+
+返回重点：
+
+| 字段 | 含义 |
+| --- | --- |
+| `data.summary.event_count` | 已记录的增量变化事件数 |
+| `data.summary.semantic_change_event_count` | 有语义变化的事件数 |
+| `data.events[].code_changed_task_count` | 代码语义变化任务数 |
+| `data.events[].affected_task_count` | 受影响任务数 |
+| `data.events[].affected_metric_count` | 受影响指标数 |
+
+## 17. 展开局部知识图谱
+
+用于从任务、表、字段、指标等任意实体出发，按方向、深度和关系范围返回一张可直接画图的局部子图。适合汇报展示、智能体取证、大模型上下文压缩。
+
+接口：
+
+```text
+POST {BASE_URL}/api/graph/neighborhood
+```
+
+请求示例：
+
+```bash
+curl -s -X POST {BASE_URL}/api/graph/neighborhood \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "project_id": "iresearch",
+    "subject": {
+      "key": "upper_grp_name",
+      "entity_type": "column"
+    },
+    "direction": "downstream",
+    "relation_profile": "column_lineage",
+    "max_hops": 3,
+    "limit_nodes": 100,
+    "limit_edges": 300
+  }'
+```
+
+常用参数：
+
+| 字段 | 含义 |
+| --- | --- |
+| `subject.entity_id` | 精确实体 ID，优先推荐 |
+| `subject.key` + `subject.entity_type` | 模糊锚点，会触发实体解析和消歧 |
+| `direction` | `upstream`、`downstream`、`both` |
+| `relation_profile` | `schedule`、`dataset_lineage`、`column_lineage`、`code`、`metric`、`lineage`、`all_safe` |
+| `max_hops` | 展开深度，展示用建议 2-4 跳 |
+| `limit_nodes` / `limit_edges` | 控制局部图大小，防止大图爆炸 |
+
+返回重点：
+
+| 字段 | 含义 |
+| --- | --- |
+| `data.visual_graph.nodes` | 页面可直接渲染的节点 |
+| `data.visual_graph.edges` | 页面可直接渲染的边，`source/target` 按展开方向排列 |
+| `data.summary.truncated` | 是否发生截断 |
+| `entities` / `evidence` / `paths` | 兼容标准查询协议的实体、证据和样例路径 |
+
+汇报展示页：
+
+```text
+GET {BASE_URL}/showcase
+```
+
+该页面会读取 `/api/projects` 和 `/api/graph/neighborhood`，展示已导入项目概览，并支持从锚点展开局部知识图谱。
+
+如果直接双击 HTML 文件，以 `file://` 方式打开页面，页面左侧的“接口地址”会默认使用 `http://127.0.0.1:8790`。如果查询服务运行在其他机器或端口，请在该输入框中改成实际地址。
+
+## 18. 分页查询
 
 如果响应中：
 
@@ -460,9 +592,11 @@ curl -s -X POST {BASE_URL}/api/path/explain \
 }
 ```
 
-## 16. 调用建议
+## 19. 调用建议
 
 - 业务口径答疑优先使用：`/api/entities/search`、`/api/metrics/context`、`/api/definitions/issues`。
 - 取数逻辑答疑优先使用：`/api/datasets/context`、`/api/tasks/context`、`/api/lineage/upstream`。
 - 下游影响分析优先使用：`/api/impact/analyze`。
+- 项目变更回顾优先使用：`/api/changes/recent`。
+- 汇报展示和局部证据图优先使用：`/api/graph/neighborhood` 或 `/showcase`。
 - 如果搜索结果 `status=ambiguous`，应让用户补充表名、字段名、任务 ID 或指标 ID 后再查询。

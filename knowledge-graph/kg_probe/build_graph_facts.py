@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 from datetime import datetime
 from pathlib import Path
 import re
+
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def load(path: Path, default):
@@ -31,6 +34,19 @@ def edge(edge_id: str, from_id: str, to_id: str, rel_type: str, **props) -> dict
         "type": rel_type,
         "properties": clean,
     }
+
+
+def clean_html_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = html.unescape(str(value))
+    return HTML_TAG_RE.sub("", text).strip()
+
+
+def clean_identifier(value: object) -> str:
+    text = clean_html_text(value)
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
+    return text.strip("_").lower()
 
 
 def generated_expression_id(statement_id: str, projection_ordinal: int | str, expression_sql: str) -> str:
@@ -60,6 +76,8 @@ def confidence_for_edge(edge_item: dict) -> str:
         if str(source_resolution).startswith("cte_"):
             return "medium"
         return "low"
+    if rel_type == "INFLUENCED_BY":
+        return "medium"
     if rel_type == "GENERATED_BY_EXPRESSION":
         return "medium"
     if rel_type in {"PRODUCES", "CONSUMES", "COMPUTED_BY", "OWNS", "BELONGS_TO_LAYER", "EMITS_SQL"}:
@@ -100,7 +118,7 @@ def fact_type_for_edge(edge_item: dict) -> str:
         return "schedule_lineage"
     if rel_type in {"READS", "WRITES", "DATASET_DEPENDS_ON", "PRODUCES", "CONSUMES"}:
         return "table_lineage"
-    if rel_type in {"DERIVED_FROM", "HAS_COLUMN", "GENERATED_BY_EXPRESSION"}:
+    if rel_type in {"DERIVED_FROM", "INFLUENCED_BY", "HAS_COLUMN", "GENERATED_BY_EXPRESSION"}:
         return "column_lineage"
     if rel_type in {"STORED_IN", "COMPUTED_BY", "HAS_DEFINITION"}:
         return "metric_lineage"
@@ -111,6 +129,35 @@ def fact_type_for_edge(edge_item: dict) -> str:
     if rel_type in {"BELONGS_TO_LAYER"}:
         return "classification"
     return "relationship"
+
+
+def quality_profile(props: dict) -> dict:
+    confidence = props.get("confidence", "medium")
+    confidence_score = {"high": 35, "medium": 25, "low": 10, "unknown": 0}.get(str(confidence).lower(), 0)
+    source_system = str(props.get("source_system") or "").lower()
+    source_score = 25 if source_system in {"horae", "szconnector", "sqlglot"} else (15 if source_system else 8)
+    evidence_score = 20 if (props.get("statement_id") or props.get("task_id") or props.get("evidence_from_id")) else 8
+    inferred = bool(props.get("inferred"))
+    inferred_penalty = 10 if inferred else 0
+    review_bonus = 5 if props.get("review_status") == "confirmed" else 0
+    score = max(0, min(100, confidence_score + source_score + evidence_score + review_bonus - inferred_penalty))
+    if score >= 75:
+        tier = "high_quality"
+        admission = "accepted"
+    elif score >= 50:
+        tier = "usable_with_context"
+        admission = "accepted_with_inference" if inferred else "accepted"
+    elif score >= 30:
+        tier = "candidate"
+        admission = "needs_review"
+    else:
+        tier = "low_quality"
+        admission = "temporary_context"
+    return {
+        "quality_score": score,
+        "quality_tier": tier,
+        "knowledge_admission": admission,
+    }
 
 
 def decorate_facts(
@@ -131,6 +178,7 @@ def decorate_facts(
         props.setdefault("built_at", built_at)
         props.setdefault("confidence", "high" if props.get("source_system") in {"horae", "szconnector"} else "medium")
         props.setdefault("inferred", props.get("source_type") in {"inferred", "sql_lineage_inferred"})
+        props.update({key: value for key, value in quality_profile(props).items() if key not in props})
     for edge_item in edges.values():
         props = edge_item.setdefault("properties", {})
         props.setdefault("fact_type", fact_type_for_edge(edge_item))
@@ -142,11 +190,13 @@ def decorate_facts(
         props.setdefault("inferred", props.get("source_type") in {"schedule_dependency_outputs", "dataset_name_rule", "task_detail_sync_info", "sql_lineage_inferred"})
         props.setdefault("evidence_from_id", edge_item.get("from"))
         props.setdefault("evidence_to_id", edge_item.get("to"))
+        props.update({key: value for key, value in quality_profile(props).items() if key not in props})
 
 
 def owner_ids(raw: str) -> list[str]:
     if not raw:
         return []
+    raw = clean_html_text(raw)
     normalized = raw.replace("，", ",").replace("/", ",").replace("、", ",")
     return [item.strip() for item in normalized.split(",") if item.strip()]
 
@@ -162,17 +212,17 @@ def person_names(raw) -> list[str]:
             if isinstance(item, dict):
                 name = item.get("name") or item.get("userName") or item.get("code")
                 if name:
-                    names.append(str(name))
+                    names.append(clean_html_text(name))
             elif item:
-                names.append(str(item))
+                names.append(clean_html_text(item))
         return names
     return []
 
 
 def code_value(raw) -> str:
     if isinstance(raw, dict):
-        return raw.get("code") or raw.get("name") or raw.get("value") or ""
-    return str(raw) if raw is not None else ""
+        return clean_html_text(raw.get("code") or raw.get("name") or raw.get("value") or "")
+    return clean_html_text(raw) if raw is not None else ""
 
 
 def dataset_layer(dataset: str) -> str:
@@ -295,6 +345,7 @@ def main() -> None:
     datasets = load(base / f"{args.prefix}_datasets.json", [])
     dataset_edges = load(base / f"{args.prefix}_dataset_edges.json", [])
     column_lineage = load(base / f"{args.prefix}_column_lineage.json", [])
+    column_influence = load(base / f"{args.prefix}_column_influence.json", [])
     logs = load(base / "log_artifacts_full.json", load(base / "log_artifacts.json", []))
     dms_records = load(base / "sz_metadata" / "dataset_dms.json", [])
     indicator_records = load(base / "sz_metadata" / "indicator_registry.json", [])
@@ -439,12 +490,12 @@ def main() -> None:
             name=item["dataset"],
             layer=item.get("layer", ""),
             source_type="sql_parse",
-            comment=dms_exact.get("comment") or dms_exact.get("description", ""),
-            qualified_name=dms_exact.get("qualifiedName", ""),
-            guid=dms_exact.get("guid", ""),
-            db_name=dms_exact.get("dbName", ""),
-            type_name=dms_exact.get("typeName", ""),
-            owner=dms_exact.get("owner", ""),
+            comment=clean_html_text(dms_exact.get("comment") or dms_exact.get("description", "")),
+            qualified_name=clean_html_text(dms_exact.get("qualifiedName", "")),
+            guid=clean_html_text(dms_exact.get("guid", "")),
+            db_name=clean_html_text(dms_exact.get("dbName", "")),
+            type_name=clean_html_text(dms_exact.get("typeName", "")),
+            owner=clean_html_text(dms_exact.get("owner", "")),
             dms_exact_count=dms_item.get("exact_count"),
             dms_total=dms_item.get("total"),
         )
@@ -472,14 +523,16 @@ def main() -> None:
         for column in dms_exact.get("refColumns") or []:
             if not isinstance(column, dict) or not column.get("name"):
                 continue
-            column_name = str(column["name"]).lower()
+            column_name = clean_identifier(column["name"])
+            if not column_name:
+                continue
             column_id = f"column:{item['dataset']}.{column_name}"
             nodes[column_id] = node(
                 column_id,
                 ["Column"],
                 name=column_name,
                 dataset=item["dataset"],
-                comment=column.get("comment", ""),
+                comment=clean_html_text(column.get("comment", "")),
                 source_system="szconnector",
                 source_type="dms_ref_columns",
             )
@@ -493,24 +546,24 @@ def main() -> None:
 
         ind_item = indicators_by_dataset.get(item["dataset"], {})
         for rec in ind_item.get("exact_records") or []:
-            metric_key = rec.get("indexId") or f"{item['dataset']}:{rec.get('englishName') or rec.get('chineseName')}"
+            metric_key = clean_html_text(rec.get("indexId")) or f"{item['dataset']}:{clean_identifier(rec.get('englishName') or rec.get('chineseName'))}"
             metric_id = f"metric:{metric_key}"
             nodes[metric_id] = node(
                 metric_id,
                 ["Metric"],
-                metric_id=rec.get("indexId", ""),
-                chinese_name=rec.get("chineseName") or rec.get("abbreviation", ""),
-                abbreviation=rec.get("abbreviation", ""),
-                english_name=rec.get("englishName", ""),
+                metric_id=clean_html_text(rec.get("indexId", "")),
+                chinese_name=clean_html_text(rec.get("chineseName") or rec.get("abbreviation", "")),
+                abbreviation=clean_html_text(rec.get("abbreviation", "")),
+                english_name=clean_html_text(rec.get("englishName", "")),
                 dataset=item["dataset"],
                 index_type=code_value(rec.get("indexType")),
                 index_gran=code_value(rec.get("indexGran")),
                 release_status=code_value(rec.get("releaseStatus")),
-                business_cycle=rec.get("busiCyc", ""),
-                horae_task_id=rec.get("horaeTaskId", ""),
-                version_no=rec.get("versionNo", ""),
-                create_time=rec.get("createTime", ""),
-                update_time=rec.get("lastUpdateTime", ""),
+                business_cycle=clean_html_text(rec.get("busiCyc", "")),
+                horae_task_id=clean_html_text(rec.get("horaeTaskId", "")),
+                version_no=clean_html_text(rec.get("versionNo", "")),
+                create_time=clean_html_text(rec.get("createTime", "")),
+                update_time=clean_html_text(rec.get("lastUpdateTime", "")),
                 source_system="szconnector",
             )
             edges[f"{metric_id}->STORED_IN->{dataset_id}"] = edge(
@@ -532,12 +585,12 @@ def main() -> None:
                         source_system="szconnector",
                     )
 
-            definition = rec.get("businessDefinition") or ""
+            definition = clean_html_text(rec.get("businessDefinition") or "")
             definition_id = f"metric_definition:{metric_key}"
             nodes[definition_id] = node(
                 definition_id,
                 ["MetricDefinition"],
-                metric_id=rec.get("indexId", ""),
+                metric_id=clean_html_text(rec.get("indexId", "")),
                 definition=definition,
                 source_system="szconnector",
                 source_type="indicator_registry",
@@ -726,6 +779,36 @@ def main() -> None:
             target_resolution=item.get("target_resolution"),
             branch_ordinal=item.get("branch_ordinal"),
             projection_ordinal=item.get("projection_ordinal"),
+            source_system=item.get("source_system"),
+            source_type=item.get("source_type"),
+        )
+
+    for item in column_influence:
+        source_dataset = (item.get("source_dataset") or "").lower()
+        target_dataset = (item.get("target_dataset") or "").lower()
+        source_column = item.get("source_column") or ""
+        target_column = item.get("target_column") or ""
+        if not source_dataset or not target_dataset or not source_column or not target_column:
+            continue
+        source_column_id = add_column_node(nodes, edges, source_dataset, source_column)
+        target_column_id = add_column_node(nodes, edges, target_dataset, target_column)
+        statement_id = f"sql:{item.get('statement_id')}"
+        edge_id = (
+            f"{target_column_id}->INFLUENCED_BY->{source_column_id}:"
+            f"{item.get('statement_id')}:{item.get('branch_ordinal')}:{item.get('influence_type')}"
+        )
+        edges[edge_id] = edge(
+            edge_id,
+            target_column_id,
+            source_column_id,
+            "INFLUENCED_BY",
+            statement_id=statement_id,
+            task_id=item.get("task_id"),
+            source_resolution=item.get("source_resolution"),
+            target_resolution=item.get("target_resolution"),
+            branch_ordinal=item.get("branch_ordinal"),
+            influence_type=item.get("influence_type"),
+            expression_sql=item.get("expression_sql"),
             source_system=item.get("source_system"),
             source_type=item.get("source_type"),
         )

@@ -2,178 +2,223 @@
 
 ## 1. 建设目标
 
-本项目从调度任务和实际运行代码出发，逆向还原大数据加工逻辑，建设“双层知识图谱”：
+本项目从调度任务、运行态 SQL、任务配置、表字段元数据和指标登记信息出发，逆向还原大数据项目的加工逻辑，形成面向人员、智能体和大模型可查询、可解释、可审计的代码知识图谱。
 
-- 底层代码语义图：调度任务、运行日志、SQL、表、字段及血缘。
-- 上层业务数据资产图：指标、登记口径、代码口径、负责人及数据分层。
-- 两层通过`READS`、`WRITES`、`PRODUCES`、`CONSUMES`、`COMPUTED_BY`、`STORED_IN`、`DERIVED_FROM`等关系连接。
+核心目标：
 
-图谱后续面向人员、智能体和大模型，支持代码口径、业务口径、上下游血缘、变更影响、资产发现和治理审计等场景。
+- 还原项目内任务、SQL、表、字段、指标和口径之间的关系。
+- 支持代码口径、业务口径、取数逻辑、上下游血缘和变更影响分析。
+- 为大模型提供带边界、来源、置信度和证据链的可信上下文。
+- 支持多项目导入、项目内查询和轻量展示。
+- 保留可复核的中间事实文件，使图谱可重建、可验证、可迁移。
 
-## 2. 当前建设状态
+## 2. 当前整体能力
 
-当前已完成单项目端到端原型，入口为20个结果任务ID：
+当前项目已形成一套可复用流水线：
 
 ```text
-结果任务ID
-→ 递归采集完整上游
-→ 获取任务代码和运行SQL
-→ SQL及字段血缘解析
-→ 统一事实建模
-→ LLM代码口径生成与登记口径比较
-→ Neo4j导入和验证
-→ 48小时增量变化检测
+结果任务 ID / 项目任务清单
+→ 递归采集上游调度依赖和任务元信息
+→ 采集任务页面代码、运行日志 SQL、表字段元数据、指标登记口径
+→ 清洗并解析 SQL
+→ 抽取表级血缘和字段级血缘
+→ 生成统一节点、边事实 JSONL
+→ 生成 LLM 指标代码口径并与登记口径比较
+→ 导入 Neo4j
+→ 通过查询 API 和离线校验验证图谱质量
 ```
 
-`trial_project`当前规模：
+当前已支持多项目导入和按 `project_id` 隔离查询。已验证项目包括：
 
-| 内容 | 数量 |
-|---|---:|
-| 图节点 | 56,619 |
-| 图关系 | 104,828 |
-| 调度任务 | 2,154 |
-| 数据表 | 3,197 |
-| 字段 | 44,904 |
-| SQL语句 | 3,335 |
-| 指标 | 319 |
-| 代码口径 | 319 |
-| 口径比较 | 319 |
-| 字段血缘 | 13,350 |
-
-完整性验证结果：缺失边端点、必填属性缺失、孤立节点均为0。
+| project_id | 项目名称 |
+| --- | --- |
+| `digital_operations` | 数字化运营 |
+| `project_customer_report` | 客户报告 |
+| `project_stastic_month` | 统计月报 |
+| `t0` | T0 |
+| `project_sale_new` | 交叉销售 |
+| `sale` | 交叉销售（全） |
+| `iresearch` | 研究业务 |
+| `trial_project` | 试验项目 |
 
 ## 3. 总体架构
 
 ```mermaid
 flowchart TB
-    subgraph S["数据源"]
-        H1["Horae任务详情"]
-        H2["Horae调度依赖"]
-        H3["任务页面SQL/配置"]
-        H4["Hive运行日志"]
-        SZ1["SzConnector表字段元数据"]
-        SZ2["SzConnector指标登记"]
-        REG["项目调度ID登记"]
+    subgraph Source["源数据"]
+        A["项目任务入口"]
+        B["调度任务详情"]
+        C["调度上下游依赖"]
+        D["任务页面 SQL/配置"]
+        E["运行日志 SQL"]
+        F["表字段元数据"]
+        G["指标登记口径"]
     end
 
-    subgraph C["采集层"]
-        LC["上游递归采集"]
-        CC["任务代码采集"]
-        MC["表与指标元数据采集"]
-        SNAP["原始快照与Hash"]
+    subgraph Collect["采集层"]
+        C1["上游递归穿透"]
+        C2["任务代码采集"]
+        C3["运行日志采集"]
+        C4["表与指标元数据采集"]
+        C5["采集快照与 Hash"]
     end
 
-    subgraph P["解析层"]
-        CLEAN["日志清洗与SQL切分"]
-        AST["sqlglot AST解析"]
-        TL["表级读写血缘"]
-        CL["字段级血缘"]
+    subgraph Parse["解析层"]
+        P1["日志清洗与 SQL 切分"]
+        P2["SQL AST 解析"]
+        P3["表级读写血缘"]
+        P4["字段级直接/间接血缘"]
+        P5["解析质量报告"]
     end
 
-    subgraph F["事实层"]
-        NF["统一节点事实"]
-        EF["统一关系事实"]
-        AUDIT["来源/证据/置信度/批次"]
+    subgraph Fact["事实层"]
+        F1["节点事实 JSONL"]
+        F2["关系事实 JSONL"]
+        F3["证据、置信度、质量标签"]
+        F4["事实审计"]
     end
 
-    subgraph L["LLM口径层"]
-        EB["指标证据包"]
-        CD["代码口径"]
-        CMP["登记口径比较"]
+    subgraph LLM["LLM 口径层"]
+        L1["指标证据包"]
+        L2["代码优先口径生成"]
+        L3["登记口径比较"]
+        L4["人工补充口径扩展口"]
     end
 
-    subgraph G["图谱层"]
-        JSONL["JSONL图事实"]
-        NEO["Neo4j"]
-        QA["完整性和查询验证"]
+    subgraph Ontology["Ontology 候选层"]
+        O1["指标/字段画像"]
+        O2["口径族候选发现"]
+        O3["关系类型与证据"]
+        O4["人工复核清单"]
     end
 
-    subgraph I["增量更新层"]
-        SCAN["48小时扫描"]
-        DIFF["语义差异检测"]
-        IMPACT["受影响任务和指标"]
-        REBUILD["变化后项目重建"]
+    subgraph Graph["图谱层"]
+        G1["Neo4j 导入"]
+        G2["图完整性验证"]
+        G3["多项目隔离"]
     end
 
-    S --> C --> P --> F --> G
-    F --> L --> G
-    REG --> SCAN --> DIFF --> IMPACT --> REBUILD --> C
+    subgraph Query["查询服务层"]
+        Q1["查询原语"]
+        Q2["HTTP API"]
+        Q3["局部图接口"]
+    end
+
+    subgraph Incremental["增量更新"]
+        I1["项目登记配置"]
+        I2["周期扫描"]
+        I3["语义差异检测"]
+        I4["受影响对象摘要"]
+        I5["变化后重建"]
+    end
+
+    Source --> Collect --> Parse --> Fact --> Graph --> Query
+    Fact --> LLM --> Graph
+    Fact --> Ontology
+    LLM --> Ontology
+    Ontology --> Graph
+    Incremental --> Collect
 ```
 
-## 4. 数据分层约定
+## 4. 采集层
 
-券商大数据标准链路为：
+采集层负责把分散在调度、日志、元数据和指标登记中的信息统一落盘，形成可重放的项目原始产物。
+
+### 4.1 输入方式
+
+项目以一组结果任务 ID 作为入口。系统会从入口任务向上递归穿透，直到没有上游依赖或达到用户配置的深度、节点上限。
+
+对于无法通过标准调度关系自动发现的任务，保留人工登记扩展口，由用户维护补充任务 ID。
+
+### 4.2 代码来源策略
+
+任务代码按“运行态优先、配置兜底”的原则采集：
+
+| 任务类别 | 主要代码来源 | 说明 |
+| --- | --- | --- |
+| Hive 类任务 | 最新成功运行日志 | 以实际运行 SQL 为准 |
+| Spark 指标类任务 | 任务页面配置 | 页面中 `prepare.sqls` 用于识别写入目标 |
+| 其他任务 | 任务页面配置 | 页面 SQL、同步配置或任务参数为主 |
+| 页面不可用场景 | 运行日志兜底 | 仅在主来源缺失时使用 |
+
+Git 设计态代码采集当前暂不作为主链路。
+
+### 4.3 采集产物
+
+典型项目产物包括：
 
 ```text
-odata → pdata → dm_index_n（指标层）→ dm（宽表层）→ 数据服务
+lineage.json
+task_details.json
+code_artifacts_page.json
+log_artifacts_full.json
+strategy_sql_statements.json
+strategy_graph_nodes.jsonl
+strategy_graph_edges.jsonl
+strategy_fact_audit.json
+strategy_quality_report.json
+sz_metadata/
+llm/
+incremental/
 ```
 
-当前图谱建模到`dm`层，数据服务层暂缓。特殊链路允许绕过标准层级，但需要在后续治理查询中识别并提示。
+## 5. 解析层
 
-## 5. 采集层
+解析层负责从 SQL 和配置中抽取结构化事实，当前以 SQL 解析为核心。
 
-### 5.1 调度入口
+### 5.1 SQL 处理
 
-用户在项目登记表中维护：
+处理流程：
 
-- 结果任务ID：系统以此为入口向上递归穿透。
-- 补充任务ID：用于无法通过标准调度依赖发现的特殊任务。
+1. 清理 Spark/Hive 配置、执行日志、进度信息和引擎噪声。
+2. 从任务页面或运行日志中切分 SQL 语句。
+3. 使用 `sqlglot` 按 Spark/Hive 方言解析 AST。
+4. 对解析不完整的 DDL、CTAS 或运行态片段做保守兜底。
+5. 合并页面代码、运行日志代码和策略 SQL，形成项目统一 SQL 事实。
 
-系统不是只采集入口任务，而是持续穿透到没有上游依赖的源头任务。
+### 5.2 表级血缘
 
-### 5.2 代码来源规则
-
-| 任务类型 | 权威代码来源 | 说明 |
-|---|---|---|
-| `hiveTask` | 最新成功运行日志 | 以实际运行SQL为准 |
-| `hiveTask-2.0` | 最新成功运行日志 | 以实际运行SQL为准 |
-| `sparkIndex` | 调度任务页面 | `prepare.sqls`用于识别目标写入表 |
-| 其他非Hive任务 | 调度任务页面 | 页面SQL或配置为主 |
-
-任务页面获取不到代码时，运行日志可作为兜底，但不能覆盖上述权威来源策略。
-
-### 5.3 元数据来源
-
-- Horae detail：任务类型、负责人、周期、集群等。
-- Horae relation：任务上下游调度依赖。
-- Horae page/log：设计配置和运行态SQL。
-- SzConnector DMS：表、字段及注释。
-- SzConnector indicator：指标名称、登记口径及存储位置。
-- Git仓库：当前暂缓。
-
-## 6. 解析层
-
-### 6.1 SQL处理
-
-1. 清理Spark/Hive配置、执行进度和引擎消息。
-2. 从页面或日志中切分SQL语句。
-3. 使用`sqlglot`按Spark方言解析。
-4. 对不完整DDL或运行噪声使用正则保留表级读写事实。
-5. 根据任务类型合并为唯一的策略SQL事实集。
-
-### 6.2 表级血缘
-
-核心方向约定：
+表级血缘的核心事实包括：
 
 ```text
-SqlStatement -[:READS]-> 来源Dataset
-SqlStatement -[:WRITES]-> 目标Dataset
-目标Dataset -[:DATASET_DEPENDS_ON]-> 来源Dataset
+SqlStatement -[:READS]-> Dataset
+SqlStatement -[:WRITES]-> Dataset
+Dataset -[:DATASET_DEPENDS_ON]-> Dataset
+ScheduleTask -[:PRODUCES]-> Dataset
+ScheduleTask -[:CONSUMES]-> Dataset
 ```
 
-### 6.3 字段血缘
+表级血缘主要用于任务链路、资产依赖、项目全貌和变更影响分析。
 
-字段血缘采用保守策略：
+### 5.3 字段级血缘
 
-- 明确表别名解析为高置信度。
-- 单一来源表、Schema唯一匹配、星号展开和CTE传播为中置信度。
-- 无法确认时不强行建立`DERIVED_FROM`。
+字段级血缘分为两类：
 
-因此“没有字段血缘边”表示当前证据不足，不等同于业务上绝对没有依赖。
+| 关系 | 含义 |
+| --- | --- |
+| `DERIVED_FROM` | 目标字段值直接来自源字段，例如投影、别名、表达式计算 |
+| `INFLUENCED_BY` | 源字段通过过滤、关联、分组、排序等方式影响结果，但不一定直接构成目标字段值 |
 
-## 7. 事实层
+当前已支持：
 
-每个节点和关系统一记录：
+- 表别名解析。
+- 单一来源表匹配。
+- Schema 唯一字段匹配。
+- CTE 传播。
+- CTAS 目标识别。
+- UNION / UNION ALL 分支投影。
+- `A.*`、`B.*` 等星号展开。
+- 过滤、关联、分组、HAVING、QUALIFY、排序等间接影响识别。
+
+字段血缘采用保守原则：证据不足时不强行建立确定性 `DERIVED_FROM`。没有字段血缘边表示当前证据不足，不等同于业务上绝对无依赖。
+
+## 6. 事实层
+
+事实层将采集和解析结果统一转成可入图的节点、边 JSONL。
+
+### 6.1 统一事实属性
+
+每个节点和关系都会携带：
 
 ```text
 fact_type
@@ -183,193 +228,461 @@ build_id
 built_at
 confidence
 inferred
+quality_score
+quality_tier
+knowledge_admission
 ```
 
-关系还可以记录来源SQL、任务、快照和解析方式。事实层以JSONL保存，作为Neo4j之外可审计、可重放的中间事实集。
+关系还会尽量携带：
 
-## 8. 图谱模型
+```text
+task_id
+statement_id
+source_type
+source_resolution
+evidence_from_id
+evidence_to_id
+influence_type
+```
 
-### 8.1 主要节点
+### 6.2 知识质量和入图准则
 
-- `Project`
-- `ScheduleTask`
-- `RuntimeLog`
-- `SqlStatement`
-- `Dataset`
-- `Column`
-- `Metric`
-- `MetricDefinition`
-- `Owner`
-- `DataLayer`
-- `EvidenceBundle`
-- `PromptTemplate`
-- `PromptRun`
-- `ModelVersion`
-- `CodeDefinition`
-- `DefinitionComparison`
+当前采用轻量质量评分：
 
-### 8.2 主要关系
+```text
+quality_score =
+  confidence_score
++ source_score
++ evidence_score
++ review_bonus
+- inferred_penalty
+```
 
-- 调度：`HAS_ENTRY_TASK`、`DEPENDS_ON`
-- 任务数据：`PRODUCES`、`CONSUMES`、`HAS_RUNTIME_LOG`、`EMITS_SQL`
-- SQL数据：`READS`、`WRITES`、`DATASET_DEPENDS_ON`
-- 字段：`HAS_COLUMN`、`DERIVED_FROM`
-- 指标：`STORED_IN`、`COMPUTED_BY`、`HAS_DEFINITION`
-- 归属：`OWNS`、`BELONGS_TO_LAYER`
-- LLM：`HAS_EVIDENCE_BUNDLE`、`EVIDENCES_*`、`HAS_CODE_DEFINITION`、`GENERATED_BY`、`USED_*`、`HAS_COMPARISON`、`COMPARES_*`
+评分维度：
 
-详细定义见[GRAPH_MODEL.md](GRAPH_MODEL.md)。
+| 维度 | 规则 |
+| --- | --- |
+| `confidence_score` | `high=35`，`medium=25`，`low=10`，`unknown=0` |
+| `source_score` | 权威采集/解析来源得 25；其他有来源得 15；无来源得 8 |
+| `evidence_score` | 有 SQL、任务或端点证据得 20；否则得 8 |
+| `review_bonus` | 人工确认后加 5 |
+| `inferred_penalty` | 推断事实扣 10 |
 
-## 9. LLM指标口径
+质量分层：
 
-### 9.1 证据组成
+| 分数 | `quality_tier` | `knowledge_admission` | 使用建议 |
+| ---: | --- | --- | --- |
+| `>=75` | `high_quality` | `accepted` | 可作为可信知识使用 |
+| `50-74` | `usable_with_context` | `accepted` 或 `accepted_with_inference` | 可用，但回答时应带证据上下文 |
+| `30-49` | `candidate` | `needs_review` | 可作为线索，建议复核 |
+| `<30` | `low_quality` | `temporary_context` | 仅作临时上下文，不给确定结论 |
 
-每个指标的证据包可以包含：
+当前策略不是低质量事实不入图，而是**全部入图、分层使用**。查询层和大模型回答层可以根据质量标签过滤或降权。
 
-- 指标登记名称和登记口径。
-- 指标存储表和字段。
-- 生产任务。
-- 写入SQL和相关来源SQL。
-- 来源表、字段血缘和表元数据。
-- Prompt模板ID、版本和Hash。
+## 7. 图谱模型
 
-### 9.2 生成与比较
+### 7.1 主要节点
 
-LLM先生成代码优先口径，再与登记口径比较。比较状态包括：
+| 节点 | 含义 |
+| --- | --- |
+| `Project` | 项目 |
+| `ScheduleTask` | 调度任务 |
+| `RuntimeLog` | 运行日志证据 |
+| `SqlStatement` | SQL 语句 |
+| `Dataset` | 表或外部数据集 |
+| `Column` | 字段 |
+| `Metric` | 指标 |
+| `MetricDefinition` | 登记口径 |
+| `CodeDefinition` | LLM 从代码证据生成的代码口径 |
+| `DefinitionComparison` | 登记口径与代码口径比较结果 |
+| `GeneratedExpression` | 无法直接落到源字段的生成表达式 |
+| `Owner` | 负责人 |
 
-| 状态 | 当前数量 |
-|---|---:|
-| 一致 | 14 |
-| 部分一致 | 137 |
-| 冲突 | 30 |
-| 登记缺失 | 41 |
-| 代码证据不足 | 97 |
+### 7.2 主要关系
 
-“代码证据不足”表示仍可查询指标、存储表、任务和登记说明，但现有SQL证据不足以确定完整计算公式、过滤条件或粒度。
+| 关系 | 含义 |
+| --- | --- |
+| `HAS_ENTRY_TASK` | 项目包含入口任务 |
+| `DEPENDS_ON` | 调度任务依赖 |
+| `HAS_RUNTIME_LOG` | 任务拥有运行日志 |
+| `EMITS_SQL` | 任务产出 SQL 语句 |
+| `READS` | SQL 读取表 |
+| `WRITES` | SQL 写入表 |
+| `PRODUCES` | 任务产出表 |
+| `CONSUMES` | 任务消费表 |
+| `DATASET_DEPENDS_ON` | 表依赖表 |
+| `HAS_COLUMN` | 表包含字段 |
+| `DERIVED_FROM` | 字段直接来源 |
+| `INFLUENCED_BY` | 字段间接受影响 |
+| `GENERATED_BY_EXPRESSION` | 字段由表达式生成 |
+| `STORED_IN` | 指标存储在表或字段 |
+| `COMPUTED_BY` | 指标由任务计算 |
+| `HAS_DEFINITION` | 指标有登记口径 |
+| `HAS_CODE_DEFINITION` | 指标有代码口径 |
+| `HAS_COMPARISON` | 指标有口径比较结果 |
+| `OWNS` | 负责人归属 |
 
-### 9.3 轻量人工补充
+## 8. LLM 指标口径
 
-当前不建设完整的人工口径审批体系，仅保留`manual_metric_overrides.json`扩展口。代码变化影响相关指标时，已有人工补充标记为`needs_review=true`。
+LLM 口径层只在用户授权后运行，当前主要面向指标。
+
+### 8.1 LLM 作用
+
+LLM 不替代图谱事实抽取。它的作用是：
+
+- 基于代码证据包生成“代码优先口径”。
+- 将代码口径与登记口径进行一致性比较。
+- 给出差异类型、证据摘要和是否需要人工复核。
+
+### 8.2 证据包
+
+每个指标的证据包可包含：
+
+- 指标名称、英文名和登记口径。
+- 指标存储表、字段和关联任务。
+- 写入 SQL、来源 SQL、字段血缘和表级血缘。
+- 表字段元数据。
+- 模型名称、证据包 Hash 和执行状态。
+
+### 8.3 比较状态
+
+当前比较状态包括：
+
+| 状态 | 含义 |
+| --- | --- |
+| `consistent` | 代码口径与登记口径基本一致 |
+| `partially_consistent` | 部分一致，但存在范围、粒度、过滤或公式差异 |
+| `conflict` | 代码口径与登记口径存在明显冲突 |
+| `registry_missing` | 缺少登记口径 |
+| `code_evidence_insufficient` | 代码证据不足，不能给出确定性口径 |
+| `manual_review_required` | 需要人工确认 |
+
+人工补充采用轻量扩展文件 `manual_metric_overrides.json`，不建设完整审批流。
+
+## 9. Ontology 候选发现
+
+Ontology 候选层用于从现有图谱事实中发现“项目里可能存在的业务对象、业务属性、度量概念、参考数据和跨表概念关系”。当前保留第二版路线，即 `ontology_v2/`：
+
+```text
+表主题识别 -> 字段组语义归纳 -> 血缘证据验证 -> 跨表概念对齐 -> 可选 LLM 精炼
+```
+
+第二版不再依赖单字段相似度来直接推断口径族，而是先理解表，再归纳表内字段组，然后用血缘证据验证，最后做跨表概念对齐。所有自动发现结果默认只作为候选，不直接改变正式图谱结论。
+
+### 9.1 输入证据
+
+输入为项目图谱产物目录，优先读取：
+
+```text
+strategy_llm_graph_nodes.jsonl
+strategy_llm_graph_edges.jsonl
+```
+
+如果没有 LLM 图谱产物，则回退读取：
+
+```text
+strategy_graph_nodes.jsonl
+strategy_graph_edges.jsonl
+```
+
+主要使用以下证据：
+
+- 指标名称、英文名、登记口径、代码口径、口径比对状态。
+- 指标存储表、代码来源表、计算任务。
+- 字段名称、字段注释、所属表。
+- 字段直接血缘、间接影响血缘、共同上游和共同下游。
+- 节点和边上的 `confidence`、`quality_score`、`knowledge_admission`。
+
+### 9.2 表主题与字段组发现
+
+一键执行：
+
+```bash
+python3 run_ontology_v2.py <project_dir> \
+  --prefix strategy \
+  --project-key <project_id>
+```
+
+默认内部四步：
+
+| 步骤 | 脚本 | 输出 |
+| --- | --- | --- |
+| 表主题识别 | `build_table_profiles.py` | `table_profiles.jsonl` |
+| 字段组语义归纳 | `discover_field_groups.py` | `field_groups.jsonl` |
+| 血缘路径验证 | `verify_concept_evidence.py` | `verified_field_groups.jsonl`、`field_group_relations.jsonl` |
+| 跨表概念对齐 | `align_concepts.py` | `concept_candidates.jsonl`、`concept_relations.jsonl` |
+
+默认流程为离线规则版，不依赖 LLM。需要更自然的业务解释和拆并建议时，可以显式启用 LLM 精炼：
+
+```bash
+python3 refine_ontology_concepts_with_llm.py <project_dir> \
+  --provider openai-compatible \
+  --model deepseek-v4-pro \
+  --base-url https://api.deepseek.com \
+  --limit 5 \
+  --min-score 0.79
+```
+
+也可以在一键流程中启用：
+
+```bash
+python3 run_ontology_v2.py <project_dir> \
+  --prefix strategy \
+  --project-key <project_id> \
+  --refine-ontology-llm \
+  --llm-provider openai-compatible \
+  --llm-model deepseek-v4-pro \
+  --llm-base-url https://api.deepseek.com
+```
+
+LLM 精炼不会覆盖规则候选，而是生成独立的 `OntologyLLMRefinement` 事实，用于解释候选概念、给出拆分/合并建议、列出证据边界和业务复核问题。
+
+新增候选节点类型：
+
+| 节点 | 含义 |
+| --- | --- |
+| `TableProfile` | 表主题画像，如结果事实表、参数配置表、主数据表、关系映射表 |
+| `SemanticFieldGroup` | 表内字段组，如合约/协议、交易对手/客户、产品/标的、销售收入 |
+| `OntologyEvidence` | 字段组的血缘证据验证结果 |
+| `ConceptCandidate` | 跨表对齐后的候选业务概念 |
+| `OntologyLLMRefinement` | LLM 对候选概念的业务命名、解释、拆并建议和证据边界 |
+
+新增候选关系类型：
+
+| 关系 | 含义 |
+| --- | --- |
+| `HAS_TABLE_PROFILE` | 表关联表画像 |
+| `HAS_FIELD_GROUP` | 表画像关联字段组 |
+| `CONTAINS_COLUMN` | 字段组包含字段 |
+| `SUPPORTED_BY` | 字段组由血缘证据支持 |
+| `DERIVED_FROM_GROUP` | 字段组之间存在字段血缘派生 |
+| `ALIGNED_TO` | 字段组对齐到候选概念 |
+| `REFINED_BY_LLM` | 候选概念关联 LLM 精炼结果 |
+
+`project_sale_new` 的 `ontology_v2` 验证结果：
+
+| 项 | 数量 |
+| --- | ---: |
+| 表画像 | 370 |
+| 字段组 | 675 |
+| 强证据字段组 | 134 |
+| 字段组派生关系 | 311 |
+| 跨表概念候选 | 78 |
+| 跨表候选关系 | 2929 |
+
+抽样可以发现“场外衍生品销售日报”“合约/协议”“交易对手/客户”“产品/标的”“销售收入/创收”“费率/费用/收益率”“本金/保证金”等业务对象和概念族。
+
+接入 DeepSeek 后，对 `project_sale_new` 5 个高分候选做真实 LLM 精炼：
+
+| 规则候选 | LLM 建议概念名 | 置信度 | 关键判断 |
+| --- | --- | --- | --- |
+| 本金/保证金 | 场外衍生品名义本金与保证金 | high | 建议拆成“名义本金”和“保证金”两个概念 |
+| 时间/生命周期 | 合约生命周期关键日期 | medium | 可保留整体，但需区分约定日期、实际执行日期和系统 ETL 日期 |
+| 交易对手/客户 | 交易对手 | medium | 建议确认“交易对手”和“客户”是否等价 |
+| 合约/协议 | OTC 衍生品公司销售协议 | high | 强证据集中在 `t98_otc_deri_comp_sale_info` 系列表 |
+| 费率/费用/收益率 | 场外衍生品合约费率/费用/收益率 | high | 建议按费率、费用、收益率，或按期权/TRS 业务类型拆分 |
+
+### 9.3 输出产物
+
+`ontology_v2/` 输出：
+
+```text
+table_profiles.jsonl
+field_groups.jsonl
+verified_field_groups.jsonl
+field_group_relations.jsonl
+concept_candidates.jsonl
+concept_relations.jsonl
+llm_refined_concepts.jsonl
+ontology_llm_refinement_summary.json
+*_graph_nodes.jsonl
+*_graph_edges.jsonl
+ontology_v2_manifest.json
+```
+
+### 9.4 入图原则
+
+Ontology 候选采用“候选先行、人工确认、确认后入正式知识”的原则：
+
+- 自动发现结果默认 `knowledge_admission=needs_review`。
+- 高分候选也不自动等同于标准口径。
+- 人工确认后可升级为正式 `ConceptFamily`、`BELONGS_TO_FAMILY`、`SAME_SOURCE_VARIANT` 等关系。
+- 低证据或冲突候选保留在复核清单，不参与确定性问答。
 
 ## 10. 增量更新
 
-### 10.1 第一版策略
+当前增量更新采用“轻量检测、变化后整项目重建”的策略。
+
+### 10.1 检测内容
+
+- 任务新增、删除。
+- 调度依赖变化。
+- 任务元信息变化。
+- 页面代码变化。
+- 运行 SQL 变化。
+- SQL 语义 Hash 变化。
+- 表字段元数据变化。
+- 指标登记变化。
+
+### 10.2 更新流程
 
 ```text
-每天触发扫描器
-→ 根据项目配置判断是否已满48小时
-→ 刷新完整上游依赖和任务代码
+读取项目登记配置
+→ 判断是否达到扫描间隔
+→ 刷新任务、依赖、代码和元数据
 → 执行采集质量门禁
-→ 比较原始Hash和SQL语义Hash
-→ 无语义变化则结束
-→ 有变化则计算受影响下游任务和指标
-→ 调用项目完整流水线重建
+→ 计算原始 Hash 和语义 Hash
+→ 生成变化事件
+→ 如果无语义变化，更新扫描状态
+→ 如果有语义变化，计算受影响任务/指标并触发项目重建
 ```
-
-第一版选择“轻量检测、变化后整项目重建”，暂不直接局部修改Neo4j。
-
-### 10.2 检测内容
-
-- 任务新增和删除。
-- 调度依赖新增和删除。
-- 任务类型、负责人等元数据变化。
-- 页面SQL和Hive运行SQL变化。
-- 仅格式变化与语义变化区分。
-- 已刷新表Schema和指标登记变化。
 
 ### 10.3 质量门禁
 
-出现以下情况时停止本轮更新并保留旧基线：
+出现以下情况时，本轮增量不覆盖旧基线：
 
 - 入口任务缺失。
-- 上游穿透错误。
+- 上游穿透失败。
 - 任务详情采集失败。
 - 页面代码请求失败。
-- Hive任务缺少最新成功日志。
+- Hive 类任务缺少最新成功运行日志。
 - 日志请求失败。
+- 表字段或指标元数据刷新失败达到不可接受程度。
 
-失败记录写入`incremental/failures/`，不会触发图谱重建。
+失败记录写入 `incremental/failures/`。
 
-### 10.4 产物
+### 10.4 增量产物
 
 ```text
 incremental/current_snapshot.json
 incremental/state.json
-incremental/changes/<时间>.json
-incremental/failures/<时间>.json
+incremental/changes/<timestamp>.json
+incremental/failures/<timestamp>.json
 incremental/scan.lock
 ```
 
-详细操作见[INCREMENTAL_UPDATE.md](INCREMENTAL_UPDATE.md)。
+当前不做 Neo4j 节点级局部修改。检测到语义变化后，按项目重建并重新导入，保证图内事实一致。
 
-## 11. 图谱发布与验证
+## 11. 图谱导入与验证
 
-每次构建执行：
+图谱导入 Neo4j 前后都会执行质量检查。
 
-- 必填属性检查。
-- 边端点检查。
-- 孤立节点检查。
-- 置信度分布检查。
-- 表和指标覆盖率检查。
-- 离线血缘路径查询。
-- Neo4j节点、边、标签和关系数量验证。
+验证内容：
 
-当前Neo4j导入为全量替换。后续局部更新需要引入暂存图、构建版本和原子发布，不能直接边扫描边修改正式图。
+- 节点数量、边数量。
+- 标签和关系类型分布。
+- 边端点是否缺失。
+- 必填属性是否缺失。
+- 是否存在孤立节点。
+- 字段血缘样本是否可解释。
+- 指标是否关联存储表、计算任务、登记口径和代码口径。
+- Neo4j 中项目级节点、边数量是否与 JSONL 事实一致。
 
-## 12. 查询层规划
+导入支持 `project_id` 隔离。多项目可以共存于同一个 Neo4j 实例，下游查询必须显式传入 `project_id`。
 
-查询层定位为“图事实查询引擎 + 证据服务 + 智能解释层”，后续分为三种能力：
+## 12. 查询层
 
-1. 确定性图查询：指标、任务、表、字段、上下游和影响范围。
-2. 语义检索：中文名称、别名、描述和相似指标搜索。
-3. 混合问答：图谱确定事实范围，LLM负责解释并引用证据。
+查询层定位为：
 
-第一版确定12个查询原语：
+```text
+图事实查询引擎 + 证据服务 + 智能体工具接口
+```
 
-- `search_entities`
-- `resolve_entity`
-- `get_metric_context`
-- `get_task_context`
-- `get_dataset_context`
-- `get_column_context`
-- `trace_upstream`
-- `trace_downstream`
-- `analyze_impact`
-- `compare_metric_definitions`
-- `find_definition_issues`
-- `explain_lineage_path`
+LLM 或机器人不直接执行任意 Cypher，而是调用受控查询原语。查询层负责参数校验、项目隔离、分页、实体消歧、证据返回和错误边界。
 
-LLM不直接执行任意Cypher，而是将自然语言转换为受控查询计划，再由参数化模板访问Neo4j。
+### 12.1 标准返回协议
 
-所有原语使用统一响应协议，包含`status`、`data`、`entities`、`paths`、`evidence`、`warnings`、`graph_context`、分页和诊断信息。业务证据不足返回`partial`，实体歧义返回`ambiguous`，不得伪装成确定答案。
+所有查询原语统一返回：
 
-详细协议、原语契约、限制和验收标准见[QUERY_LAYER_DESIGN.md](QUERY_LAYER_DESIGN.md)。
+```text
+request_id
+primitive
+status
+answer
+data
+entities
+paths
+evidence
+warnings
+graph_context
+page
+diagnostics
+```
 
-当前已完成Python查询内核、CLI、统一JSON Schema和12个原语的真实Neo4j验证。REST、MCP和可视化界面尚未封装。
+状态语义：
+
+| 状态 | 含义 |
+| --- | --- |
+| `ok` | 查询成功 |
+| `partial` | 有结果但存在截断、证据不足或质量告警 |
+| `ambiguous` | 输入命中多个候选，需要消歧 |
+| `not_found` | 未找到目标实体 |
+| `error` | 请求非法或查询失败 |
+
+### 12.2 当前查询原语
+
+当前支持 14 个查询原语：
+
+| 原语 | 用途 |
+| --- | --- |
+| `search_entities` | 搜索任务、表、字段、指标 |
+| `resolve_entity` | 实体解析与消歧 |
+| `get_metric_context` | 查询指标上下文 |
+| `get_task_context` | 查询任务上下文 |
+| `get_dataset_context` | 查询表上下文 |
+| `get_column_context` | 查询字段上下文 |
+| `trace_upstream` | 查询上游路径 |
+| `trace_downstream` | 查询下游路径 |
+| `analyze_impact` | 变更影响分析 |
+| `compare_metric_definitions` | 查询单个指标登记口径与代码口径比较 |
+| `find_definition_issues` | 批量查询口径差异问题 |
+| `explain_lineage_path` | 解释两个实体之间的血缘路径 |
+| `get_recent_changes` | 查询增量变化事件 |
+| `get_graph_neighborhood` | 从任意节点展开局部知识图谱 |
+
+### 12.3 HTTP API
+
+当前已封装 HTTP 查询服务，主要接口包括：
+
+```text
+GET  /health
+GET  /api/projects
+GET  /api/primitives
+GET  /api/projects/{project_id}/graph-status
+POST /api/entities/search
+POST /api/query/resolve_entity
+POST /api/impact/analyze
+POST /api/metrics/context
+POST /api/metrics/definition-compare
+POST /api/tasks/context
+POST /api/datasets/context
+POST /api/columns/context
+POST /api/lineage/upstream
+POST /api/lineage/downstream
+POST /api/path/explain
+POST /api/changes/recent
+POST /api/graph/neighborhood
+```
+
+接口支持分页、大结果摘要、项目内查询和实体歧义返回。
 
 ## 13. 安全与审计
 
-- Cookie、Token、API Key、Neo4j密码不得进入代码仓库。
-- 真实SQL、运行日志、表样例和图谱产物不进入源码Git仓库。
-- 向外部LLM发送SQL和元数据前需要明确授权。
-- 每次LLM调用保存模型版本、证据包、输入Hash和状态。
-- 查询层后续需要增加项目、表、字段级权限和查询审计。
+- Cookie、Token、API Key、Neo4j 密码不得进入代码仓库。
+- 真实 SQL、运行日志、表样例和图谱产物不进入源码 Git 仓库。
+- 调用外部 LLM 前必须明确获得发送 SQL 和元数据的授权。
+- LLM 调用记录模型名称、证据包、输入 Hash、输出状态和错误信息。
+- 查询接口必须传入 `project_id`，默认在项目内搜索和查询。
+- 面向多人使用时，Neo4j 可只在服务端本机访问，同事通过查询 API 使用图谱。
 
-## 14. 当前边界与后续路线
+## 14. 当前边界
 
-当前未完成：
+当前仍保留以下边界：
 
-- Git设计态代码采集。
-- 数据服务、接口、报表和推数节点。
-- 任务级Neo4j局部更新。
-- 多版本时间图和历史差异查询。
-- 正式查询API、智能体工具和用户界面。
-- 第二个项目的跨项目复用验证。
-
-推荐下一阶段：
-
-1. 实际执行一次在线增量扫描，验证Horae刷新性能和变更报告。
-2. 使用第二个项目验证登记驱动的复用能力。
-3. 对97个代码证据不足指标分类，针对性增强采集或解析。
-4. 定义查询层MVP的接口契约和参数化Cypher模板。
-5. 再评估任务级局部更新和Neo4j原子发布。
+- Git 设计态代码采集暂未纳入主链路。
+- 数据服务、接口、报表和推数资产尚未完整建模。
+- 任务级 Neo4j 局部更新暂未实现，当前采用项目级重建。
+- 多版本时间图暂未实现。
+- 查询层权限模型和审计日志尚未细化。
+- 任务/表级 LLM 摘要为可选增强能力，未作为默认流水线强制步骤。
+- Ontology/口径族发现当前为候选层，尚未默认导入正式图谱。

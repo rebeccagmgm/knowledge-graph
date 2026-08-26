@@ -22,6 +22,7 @@ REQUIRED_EDGE_PROPS = {
     "WRITES": ["task_id", "fact_type", "confidence", "build_id"],
     "DATASET_DEPENDS_ON": ["fact_type", "confidence", "build_id"],
     "DERIVED_FROM": ["statement_id", "task_id", "source_resolution", "target_resolution", "fact_type", "confidence", "build_id"],
+    "INFLUENCED_BY": ["statement_id", "task_id", "source_resolution", "target_resolution", "influence_type", "fact_type", "confidence", "build_id"],
     "DEPENDS_ON": ["source_system", "fact_type", "confidence", "build_id"],
 }
 
@@ -98,6 +99,7 @@ def audit(project_dir: Path, prefix: str) -> dict:
             metric_compute[edge["from"]] += 1
 
     derived_edges = [edge for edge in edges if edge["type"] == "DERIVED_FROM"]
+    influenced_edges = [edge for edge in edges if edge["type"] == "INFLUENCED_BY"]
     generated_edges = [edge for edge in edges if edge["type"] == "GENERATED_BY_EXPRESSION"]
     unresolved_derived = [
         edge["id"]
@@ -127,6 +129,7 @@ def audit(project_dir: Path, prefix: str) -> dict:
         "metrics_without_storage_count": sum(1 for metric_id in metrics if metric_storage[metric_id] == 0),
         "metrics_without_compute_task_count": sum(1 for metric_id in metrics if metric_compute[metric_id] == 0),
         "derived_from_count": len(derived_edges),
+        "influenced_by_count": len(influenced_edges),
         "generated_by_expression_count": len(generated_edges),
         "low_confidence_derived_from_count": len(unresolved_derived),
         "low_confidence_derived_from_sample": unresolved_derived[:20],

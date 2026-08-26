@@ -45,8 +45,7 @@ WRITE_TABLE_RE = re.compile(
     r"\b(?:insert\s+(?:overwrite|into)\s+(?:table\s+)?|"
     r"create\s+(?:temporary\s+|external\s+)?(?:table|view)\s+(?:if\s+not\s+exists\s+)?|"
     r"drop\s+table\s+(?:if\s+exists\s+)?|"
-    r"truncate\s+table\s+|"
-    r"alter\s+table\s+)"
+    r"truncate\s+table\s+)"
     r"([a-z_][\w]*\.[a-z_][\w]*)",
     re.IGNORECASE,
 )
@@ -62,6 +61,19 @@ def normalize_table_name(table: exp.Table) -> str:
         parts.append(db.name.lower())
     parts.append(table.name.lower())
     return ".".join(part for part in parts if part)
+
+
+def expression_table_name(value: exp.Expression | None) -> str:
+    """Return a qualified table name from Table or Schema expressions."""
+    if isinstance(value, exp.Table):
+        return normalize_table_name(value)
+    if isinstance(value, exp.Schema) and isinstance(value.this, exp.Table):
+        return normalize_table_name(value.this)
+    if value is not None:
+        table = value.find(exp.Table)
+        if table:
+            return normalize_table_name(table)
+    return ""
 
 
 def layer_of(dataset: str) -> str:
@@ -165,6 +177,23 @@ def extract_candidate_sql(text: str) -> list[str]:
     return list(unique.values())
 
 
+def strip_leading_sql_comments(sql: str) -> str:
+    text = sql.lstrip()
+    while text:
+        if text.startswith("--"):
+            _, sep, rest = text.partition("\n")
+            text = rest.lstrip() if sep else ""
+            continue
+        if text.startswith("/*"):
+            end = text.find("*/")
+            if end < 0:
+                return ""
+            text = text[end + 2 :].lstrip()
+            continue
+        break
+    return text
+
+
 def extract_page_sql(text: str) -> list[str]:
     text = clean_log_text(text).strip()
     if not text:
@@ -174,7 +203,7 @@ def extract_page_sql(text: str) -> list[str]:
         parts = [text]
     candidates = []
     for part in parts:
-        low = part.lower().lstrip()
+        low = strip_leading_sql_comments(part).lower().lstrip()
         if len(part) < 20:
             continue
         if not re.match(
@@ -214,25 +243,24 @@ def parse_statement(sql: str, dialect: str) -> tuple[set[str], set[str], str | N
     if parsed is None:
         return fallback_reads, fallback_writes, "empty parse result", "regex"
 
+    if isinstance(parsed, exp.Alter):
+        return set(), set(), None, "sqlglot_maintenance_ddl"
+
     write_tables: set[str] = set()
     if isinstance(parsed, exp.Insert):
-        target = parsed.this
-        if isinstance(target, exp.Table):
-            name = normalize_table_name(target)
-            if is_qualified_dataset(name):
-                write_tables.add(name)
-        elif target is not None:
-            table = target.find(exp.Table)
-            if table:
-                name = normalize_table_name(table)
-                if is_qualified_dataset(name):
-                    write_tables.add(name)
-    elif isinstance(parsed, (exp.Create, exp.Drop)):
-        target = parsed.this
-        if isinstance(target, exp.Table):
-            name = normalize_table_name(target)
-            if is_qualified_dataset(name):
-                write_tables.add(name)
+        name = expression_table_name(parsed.this)
+        if is_qualified_dataset(name):
+            write_tables.add(name)
+    elif isinstance(parsed, exp.Create):
+        target_name = expression_table_name(parsed.this)
+        has_query = parsed.args.get("expression") is not None
+        if has_query and is_qualified_dataset(target_name):
+            write_tables.add(target_name)
+        elif target_name:
+            # Plain CREATE TABLE is schema declaration for our lineage use case,
+            # not a data read/write operation. Keeping it edge-free prevents
+            # sparkIndex prepare.sqls from becoming bogus READS facts.
+            return set(), set(), None, "sqlglot_schema_ddl"
 
     all_tables = {
         name
@@ -248,12 +276,40 @@ def parse_statement(sql: str, dialect: str) -> tuple[set[str], set[str], str | N
     return read_tables, write_tables, None, "sqlglot"
 
 
+def page_prepare_targets(log_artifacts: list[dict], dialect: str) -> dict[str, set[str]]:
+    """Map task_id to table targets declared by page prepare.sqls."""
+    targets_by_task: dict[str, set[str]] = {}
+    for artifact in log_artifacts:
+        if not str(artifact.get("source_type", "")).startswith("task_page"):
+            continue
+        if artifact.get("prop_name") != "prepare.sqls":
+            continue
+        path = Path(artifact.get("path", ""))
+        if not path.exists():
+            continue
+        for sql in extract_page_sql(path.read_text(errors="ignore")):
+            normalized = normalize_sql_for_parse(sql)
+            try:
+                parsed = sqlglot.parse_one(normalized, read=dialect, error_level="ignore")
+            except Exception:  # noqa: BLE001
+                parsed = None
+            if isinstance(parsed, exp.Create):
+                target = expression_table_name(parsed.this)
+            else:
+                match = WRITE_TABLE_RE.search(normalized)
+                target = match.group(1).lower() if match else ""
+            if is_qualified_dataset(target):
+                targets_by_task.setdefault(str(artifact["task_id"]), set()).add(target.lower())
+    return targets_by_task
+
+
 def extract_project(project_dir: Path, dialect: str, log_artifacts_file: str) -> dict:
     log_artifacts_path = project_dir / log_artifacts_file
     if not log_artifacts_path.exists():
         raise SystemExit(f"Missing {log_artifacts_path}")
 
     log_artifacts = json.loads(log_artifacts_path.read_text())
+    prepare_targets = page_prepare_targets(log_artifacts, dialect)
     statements = []
     datasets = {}
     edges = []
@@ -274,6 +330,29 @@ def extract_project(project_dir: Path, dialect: str, log_artifacts_file: str) ->
             sid = f"{artifact['task_id']}_{statement_hash(sql)}"
             stmt_path = write_statement_file(project_dir, sid, sql)
             reads, writes, error, extraction_method = parse_statement(sql, dialect)
+            write_source_type = "sqlglot_table_lineage"
+            implicit_targets = set()
+            if (
+                is_page_artifact
+                and artifact.get("prop_name") == "query.sql"
+                and not writes
+            ):
+                task_targets = prepare_targets.get(str(artifact["task_id"]), set())
+                if len(task_targets) == 1:
+                    implicit_targets = set(task_targets)
+                    writes = set(task_targets)
+                    write_source_type = "task_page_prepare_target"
+                    extraction_method = f"{extraction_method}+implicit_prepare_target"
+                elif len(task_targets) > 1:
+                    errors.append(
+                        {
+                            "task_id": artifact["task_id"],
+                            "statement_id": sid,
+                            "error": "ambiguous_prepare_targets",
+                            "target_count": len(task_targets),
+                            "status": "implicit_target_not_applied",
+                        }
+                    )
             if error and not reads and not writes:
                 errors.append(
                     {
@@ -309,6 +388,10 @@ def extract_project(project_dir: Path, dialect: str, log_artifacts_file: str) ->
                     "write_dataset_count": len(writes),
                     "source_system": "horae",
                     "source_type": "runtime_log_sql",
+                    "artifact_id": artifact.get("artifact_id"),
+                    "prop_name": artifact.get("prop_name"),
+                    "table_name_hint": artifact.get("table_name_hint"),
+                    "implicit_write_datasets": sorted(implicit_targets),
                 }
             )
             for dataset in sorted(reads | writes):
@@ -330,7 +413,7 @@ def extract_project(project_dir: Path, dialect: str, log_artifacts_file: str) ->
                         "to": dataset,
                         "relation": "WRITES",
                         "task_id": artifact["task_id"],
-                        "source_type": "sqlglot_table_lineage",
+                        "source_type": write_source_type,
                     }
                 )
 

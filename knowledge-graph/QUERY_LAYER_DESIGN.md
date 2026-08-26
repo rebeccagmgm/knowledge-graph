@@ -52,7 +52,7 @@ flowchart LR
 
 查询原语是位于自然语言和Neo4j之间的最小、稳定、可组合查询能力。同一原语可以暴露为Python函数、REST API、MCP工具或智能体Tool。
 
-第一版定义12个业务查询原语：
+当前定义13个业务查询原语：
 
 | 序号 | 原语 | 作用 |
 |---:|---|---|
@@ -68,8 +68,15 @@ flowchart LR
 | 10 | `compare_metric_definitions` | 查询代码、登记和人工补充口径比较 |
 | 11 | `find_definition_issues` | 批量检索口径冲突、缺失和待复核项 |
 | 12 | `explain_lineage_path` | 解释两个实体间血缘为何成立 |
+| 13 | `get_recent_changes` | 查询项目最近增量变化事件 |
 
 `get_graph_status`作为查询网关公共接口，不占业务原语名额。
+
+`resolve_entity` 返回候选实体时应附带消歧上下文，例如字段所属表、生产任务、关联指标、任务类型等，并给出建议补充的上下文字段。
+
+`analyze_impact` 除原始受影响实体外，还应返回 `impact_groups` 和 `impact_explanations`，按直接值来源、过滤、关联、分组等原因解释影响范围。
+
+大图字段影响分析中，`max_hops` 是实际 Neo4j 路径展开上限，而不是结果返回后的过滤条件。对包含大量 `INFLUENCED_BY` 的项目，建议先用 `max_hops=3` 或 `max_hops=5` 获取局部影响，再根据需要扩大范围。
 
 ## 6. 标准请求
 

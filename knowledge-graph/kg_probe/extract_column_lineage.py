@@ -206,6 +206,11 @@ def table_aliases(parsed: exp.Expression) -> dict[str, str]:
     for table in parsed.find_all(exp.Table):
         name = table_name(table)
         if name.split(".")[-1] in cte_names:
+            alias = table.alias_or_name
+            cte_name = name.split(".")[-1]
+            if alias:
+                aliases[alias.lower()] = cte_name
+            aliases[cte_name] = cte_name
             continue
         alias = table.alias_or_name
         if alias:
@@ -226,6 +231,8 @@ def table_aliases(parsed: exp.Expression) -> dict[str, str]:
                 unique_tables.append(name)
         if len(unique_tables) == 1:
             aliases[alias.lower()] = unique_tables[0]
+        else:
+            aliases[alias.lower()] = alias.lower()
     return aliases
 
 
@@ -252,6 +259,10 @@ def select_expression_groups(parsed: exp.Expression) -> list[list[exp.Expression
     return [list(select.expressions) for select in select_queries(parsed) if select.expressions]
 
 
+def select_groups(parsed: exp.Expression) -> list[exp.Select]:
+    return [select for select in select_queries(parsed) if select.expressions]
+
+
 def output_name(expr: exp.Expression) -> str:
     alias = expr.alias_or_name
     if alias:
@@ -259,6 +270,35 @@ def output_name(expr: exp.Expression) -> str:
     if isinstance(expr, exp.Column):
         return norm_column(expr.name)
     return ""
+
+
+def nearest_select(expr: exp.Expression) -> exp.Select | None:
+    node = getattr(expr, "parent", None)
+    while node is not None:
+        if isinstance(node, exp.Select):
+            return node
+        node = getattr(node, "parent", None)
+    return None
+
+
+def relation_aliases(select: exp.Select | None) -> list[str]:
+    if select is None:
+        return []
+    aliases = []
+    from_expr = select.args.get("from_")
+    relations = []
+    if from_expr is not None and isinstance(from_expr.this, exp.Expression):
+        relations.append(from_expr.this)
+    for join in select.args.get("joins") or []:
+        if isinstance(join.this, exp.Expression):
+            relations.append(join.this)
+    for relation in relations:
+        alias = relation.alias_or_name
+        if alias:
+            value = alias.lower()
+            if value not in aliases:
+                aliases.append(value)
+    return aliases
 
 
 def expression_kind(expr: exp.Expression) -> str:
@@ -273,6 +313,14 @@ def expression_kind(expr: exp.Expression) -> str:
     if list(expr.find_all(exp.Column)):
         return "source_expression"
     return "generated_expression"
+
+
+def prefixed_confidence(prefix: str, confidence: object) -> str:
+    value = str(confidence or "unknown")
+    for known_prefix in ("cte_star_", "cte_"):
+        while value.startswith(known_prefix):
+            value = value[len(known_prefix) :]
+    return f"{prefix}{value}"
 
 
 def resolve_direct_column(
@@ -327,14 +375,153 @@ def source_columns(
         if not col_name:
             continue
         table = (col.table or "").lower()
-        if table in cte_column_sources and col_name in cte_column_sources[table]:
-            for source in cte_column_sources[table][col_name]:
-                sources.append({**source, "confidence": f"cte_{source['confidence']}"})
+        cte_key = ""
+        if table in cte_column_sources:
+            cte_key = table
+        elif table and aliases.get(table, "") in cte_column_sources:
+            cte_key = aliases[table]
+        elif not table:
+            select_aliases = relation_aliases(nearest_select(col))
+            scoped_candidates = []
+            for alias in select_aliases:
+                alias_value = aliases.get(alias, alias)
+                if alias_value in cte_column_sources and col_name in cte_column_sources[alias_value]:
+                    scoped_candidates.append(alias_value)
+            if len(scoped_candidates) == 1:
+                cte_key = scoped_candidates[0]
+            if not cte_key:
+                physical_candidates = []
+                for alias in select_aliases:
+                    dataset = aliases.get(alias, "")
+                    if "." in dataset:
+                        dataset = best_dataset_match(dataset, columns_by_dataset)
+                        if col_name in set(columns_by_dataset.get(dataset, [])):
+                            physical_candidates.append(dataset)
+                unique_physical = []
+                for candidate in physical_candidates:
+                    if candidate not in unique_physical:
+                        unique_physical.append(candidate)
+                if len(unique_physical) == 1:
+                    dataset = unique_physical[0]
+                    sources.append(
+                        {
+                            "dataset": dataset,
+                            "column": col_name,
+                            "column_id": column_id(dataset, col_name),
+                            "confidence": "scoped_single_relation",
+                        }
+                    )
+                    continue
+        if not cte_key and not table:
+            cte_candidates = []
+            for alias_value in aliases.values():
+                if alias_value in cte_column_sources and col_name in cte_column_sources[alias_value]:
+                    cte_candidates.append(alias_value)
+            unique_candidates = []
+            for candidate in cte_candidates:
+                if candidate not in unique_candidates:
+                    unique_candidates.append(candidate)
+            if len(unique_candidates) == 1:
+                cte_key = unique_candidates[0]
+            elif not unique_candidates:
+                direct_candidates = [
+                    name
+                    for name, column_map in cte_column_sources.items()
+                    if col_name in column_map
+                ]
+                if len(direct_candidates) == 1:
+                    cte_key = direct_candidates[0]
+        if cte_key and col_name in cte_column_sources[cte_key]:
+            for source in cte_column_sources[cte_key][col_name]:
+                sources.append({**source, "confidence": prefixed_confidence("cte_", source["confidence"])})
             continue
         sources.append(resolve_direct_column(col_name, table, aliases, read_datasets, columns_by_dataset))
     unique = {}
     for item in sources:
         unique[(item["dataset"], item["column"])] = item
+    return list(unique.values())
+
+
+def context_sources(
+    expr: exp.Expression | None,
+    influence_type: str,
+    aliases: dict[str, str],
+    read_datasets: set[str],
+    columns_by_dataset: dict[str, list[str]],
+    cte_column_sources: dict[str, dict[str, list[dict]]] | None = None,
+) -> list[dict]:
+    if expr is None:
+        return []
+    result = []
+    for source in source_columns(expr, aliases, read_datasets, columns_by_dataset, cte_column_sources):
+        if source.get("dataset") and source.get("column"):
+            result.append(
+                {
+                    **source,
+                    "influence_type": influence_type,
+                    "expression_sql": expr.sql()[:1000],
+                }
+            )
+    return result
+
+
+def select_context_sources(
+    select: exp.Select,
+    aliases: dict[str, str],
+    read_datasets: set[str],
+    columns_by_dataset: dict[str, list[str]],
+    cte_column_sources: dict[str, dict[str, list[dict]]] | None = None,
+) -> list[dict]:
+    sources = []
+    for influence_type, expr in {
+        "filter": select.args.get("where"),
+        "group_by": select.args.get("group"),
+        "having": select.args.get("having"),
+        "qualify": select.args.get("qualify"),
+        "order_by": select.args.get("order"),
+    }.items():
+        sources.extend(
+            context_sources(expr, influence_type, aliases, read_datasets, columns_by_dataset, cte_column_sources)
+        )
+    for join in select.args.get("joins") or []:
+        sources.extend(
+            context_sources(
+                join.args.get("on"),
+                "join_condition",
+                aliases,
+                read_datasets,
+                columns_by_dataset,
+                cte_column_sources,
+            )
+        )
+        using_expr = join.args.get("using")
+        if isinstance(using_expr, list):
+            for item in using_expr:
+                if isinstance(item, exp.Expression):
+                    sources.extend(
+                        context_sources(
+                            item,
+                            "join_using",
+                            aliases,
+                            read_datasets,
+                            columns_by_dataset,
+                            cte_column_sources,
+                        )
+                    )
+        elif isinstance(using_expr, exp.Expression):
+            sources.extend(
+                context_sources(
+                    using_expr,
+                    "join_using",
+                    aliases,
+                    read_datasets,
+                    columns_by_dataset,
+                    cte_column_sources,
+                )
+            )
+    unique = {}
+    for item in sources:
+        unique[(item["dataset"], item["column"], item["influence_type"])] = item
     return list(unique.values())
 
 
@@ -356,15 +543,16 @@ def star_sources(
 
     datasets: list[str] = []
     if table:
-        if table in cte_column_sources:
+        cte_key = table if table in cte_column_sources else aliases.get(table, "")
+        if cte_key in cte_column_sources:
             expanded = []
-            for column_name, sources in cte_column_sources[table].items():
+            for column_name, sources in cte_column_sources[cte_key].items():
                 for source in sources:
                     expanded.append(
                         {
                             **source,
                             "output_column": column_name,
-                            "confidence": f"cte_star_{source['confidence']}",
+                            "confidence": prefixed_confidence("cte_star_", source["confidence"]),
                         }
                     )
             return expanded
@@ -450,21 +638,39 @@ def build_cte_column_sources(
     columns_by_dataset: dict[str, list[str]],
 ) -> dict[str, dict[str, list[dict]]]:
     result: dict[str, dict[str, list[dict]]] = {}
-    for cte in parsed.find_all(exp.CTE):
-        cte_name = cte.alias_or_name.lower()
-        select = cte.this.find(exp.Select) if cte.this else None
-        if not select:
-            continue
-        aliases = table_aliases(cte.this)
-        cte_map: dict[str, list[dict]] = {}
-        for projection in select.expressions:
-            items, error = projection_facts(projection, aliases, read_datasets, columns_by_dataset, result)
-            if error:
+    for _ in range(4):
+        changed = False
+        for container_name, container_expr in [
+            *[(cte.alias_or_name.lower(), cte.this) for cte in parsed.find_all(exp.CTE) if cte.alias_or_name],
+            *[
+                (subquery.alias_or_name.lower(), subquery.this)
+                for subquery in parsed.find_all(exp.Subquery)
+                if subquery.alias_or_name
+            ],
+        ]:
+            selects = select_queries(container_expr) if container_expr else []
+            if not selects:
                 continue
-            for out_col, sources in items:
-                cte_map[out_col] = sources
-        if cte_map:
-            result[cte_name] = cte_map
+            aliases = table_aliases(container_expr)
+            column_map: dict[str, list[dict]] = {}
+            for select in selects:
+                for projection in select.expressions:
+                    items, error = projection_facts(projection, aliases, read_datasets, columns_by_dataset, result)
+                    if error:
+                        continue
+                    for out_col, sources in items:
+                        existing = column_map.setdefault(out_col, [])
+                        seen = {(item.get("dataset"), item.get("column"), item.get("confidence")) for item in existing}
+                        for source in sources:
+                            key = (source.get("dataset"), source.get("column"), source.get("confidence"))
+                            if key not in seen:
+                                existing.append(source)
+                                seen.add(key)
+            if column_map and column_map != result.get(container_name):
+                result[container_name] = column_map
+                changed = True
+        if not changed:
+            break
     return result
 
 
@@ -552,17 +758,17 @@ def extract_for_statement(
     outputs_by_task: dict[str, set[str]],
     columns_by_dataset: dict[str, set[str]],
     dialect: str,
-) -> tuple[list[dict], list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     statement_id = stmt["statement_id"]
     task_id = stmt["task_id"]
     statement_path = resolve_statement_path(project_dir, stmt.get("statement_path", ""), statement_id)
     if not statement_path.exists():
-        return [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_statement_file"}], []
+        return [], [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_statement_file"}], []
 
     sql = normalize_sql_for_parse(statement_path.read_text(errors="ignore"))
     should_skip, skip_reason = is_non_lineage_statement(sql)
     if should_skip:
-        return [], [], [{"statement_id": statement_id, "task_id": task_id, "reason": skip_reason}]
+        return [], [], [], [{"statement_id": statement_id, "task_id": task_id, "reason": skip_reason}]
     target_datasets = set(writes_by_stmt.get(statement_id, set()))
     target_source = "statement_write"
     sync_source_dataset, sync_target_dataset = hive_to_external_io(details_by_task.get(task_id, {}))
@@ -579,7 +785,7 @@ def extract_for_statement(
             target_datasets = set(produced)
             target_source = "task_single_produces"
         elif len(produced) > 1:
-            return [], [
+            return [], [], [
                 {
                     "statement_id": statement_id,
                     "task_id": task_id,
@@ -593,14 +799,14 @@ def extract_for_statement(
                 target_datasets = {target}
                 target_source = "parsed_write_target"
             else:
-                return [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_target_dataset"}], []
+                return [], [], [{"statement_id": statement_id, "task_id": task_id, "error": "missing_target_dataset"}], []
 
     try:
         parsed = parse_sql(sql, dialect)
     except Exception as exc:  # noqa: BLE001
-        return [], [{"statement_id": statement_id, "task_id": task_id, "error": str(exc)}], []
+        return [], [], [{"statement_id": statement_id, "task_id": task_id, "error": str(exc)}], []
     if parsed is None:
-        return [], [{"statement_id": statement_id, "task_id": task_id, "error": "empty_parse"}], []
+        return [], [], [{"statement_id": statement_id, "task_id": task_id, "error": "empty_parse"}], []
 
     if not target_datasets:
         target = write_table_name(parsed, sql, columns_by_dataset)
@@ -610,18 +816,21 @@ def extract_for_statement(
 
     projection_groups = select_expression_groups(parsed)
     if not projection_groups:
-        return [], [], [{"statement_id": statement_id, "task_id": task_id, "reason": "no_select_projection"}]
+        return [], [], [], [{"statement_id": statement_id, "task_id": task_id, "reason": "no_select_projection"}]
 
     aliases = table_aliases(parsed)
     read_datasets = set(reads_by_stmt.get(statement_id, set()))
     if sync_source_dataset:
         read_datasets.add(sync_source_dataset)
     cte_column_sources = build_cte_column_sources(parsed, read_datasets, columns_by_dataset)
+    selects = select_groups(parsed)
     facts = []
+    influence_facts = []
     errors = []
     for target_dataset in sorted(target_datasets):
         target_columns = columns_by_dataset.get(target_dataset, [])
         for branch_ordinal, projections in enumerate(projection_groups, start=1):
+            output_columns = []
             for ordinal, projection in enumerate(projections, start=1):
                 fallback_output_name = ""
                 if not (
@@ -652,6 +861,8 @@ def extract_for_statement(
                     )
                     continue
                 for out_col, sources in projected_items:
+                    if out_col and out_col not in output_columns:
+                        output_columns.append(out_col)
                     for source in sources:
                         generation_type = source.get("generation_type")
                         facts.append(
@@ -675,7 +886,35 @@ def extract_for_statement(
                                 "source_type": "generated_column" if generation_type else "column_lineage",
                             }
                         )
-    return facts, errors, []
+            if branch_ordinal <= len(selects) and output_columns:
+                for source in select_context_sources(
+                    selects[branch_ordinal - 1],
+                    aliases,
+                    read_datasets,
+                    columns_by_dataset,
+                    cte_column_sources,
+                ):
+                    for out_col in output_columns:
+                        influence_facts.append(
+                            {
+                                "statement_id": statement_id,
+                                "task_id": task_id,
+                                "target_dataset": target_dataset,
+                                "target_column": out_col,
+                                "target_column_id": column_id(target_dataset, out_col),
+                                "source_dataset": source["dataset"],
+                                "source_column": source["column"],
+                                "source_column_id": source["column_id"],
+                                "source_resolution": source["confidence"],
+                                "target_resolution": target_source,
+                                "branch_ordinal": branch_ordinal,
+                                "influence_type": source["influence_type"],
+                                "expression_sql": source.get("expression_sql", ""),
+                                "source_system": "sqlglot",
+                                "source_type": "column_influence",
+                            }
+                        )
+    return facts, influence_facts, errors, []
 
 
 def main() -> None:
@@ -701,10 +940,11 @@ def main() -> None:
     details_by_task = {str(item.get("task_id")): item for item in details}
 
     all_facts = []
+    all_influence_facts = []
     all_errors = []
     all_skipped = []
     for stmt in statements:
-        facts, errors, skipped = extract_for_statement(
+        facts, influence_facts, errors, skipped = extract_for_statement(
             project_dir,
             stmt,
             details_by_task,
@@ -715,18 +955,22 @@ def main() -> None:
             args.dialect,
         )
         all_facts.extend(facts)
+        all_influence_facts.extend(influence_facts)
         all_errors.extend(errors)
         all_skipped.extend(skipped)
 
     facts_path = project_dir / f"{args.prefix}_column_lineage.json"
+    influence_path = project_dir / f"{args.prefix}_column_influence.json"
     errors_path = project_dir / f"{args.prefix}_column_lineage_errors.json"
     skipped_path = project_dir / f"{args.prefix}_column_lineage_skipped.json"
     facts_path.write_text(json.dumps(all_facts, ensure_ascii=False, indent=2))
+    influence_path.write_text(json.dumps(all_influence_facts, ensure_ascii=False, indent=2))
     errors_path.write_text(json.dumps(all_errors, ensure_ascii=False, indent=2))
     skipped_path.write_text(json.dumps(all_skipped, ensure_ascii=False, indent=2))
     summary = {
         "statement_count": len(statements),
         "column_lineage_count": len(all_facts),
+        "column_influence_count": len(all_influence_facts),
         "derived_column_lineage_count": sum(1 for item in all_facts if item.get("source_dataset")),
         "generated_column_count": sum(1 for item in all_facts if item.get("generation_type")),
         "error_count": len(all_errors),
@@ -734,6 +978,12 @@ def main() -> None:
         "target_dataset_count": len({item["target_dataset"] for item in all_facts}),
         "source_dataset_count": len({item["source_dataset"] for item in all_facts if item["source_dataset"]}),
         "source_resolution_distribution": dict(Counter(item["source_resolution"] for item in all_facts)),
+        "influence_type_distribution": dict(
+            Counter(item["influence_type"] for item in all_influence_facts)
+        ),
+        "influence_source_resolution_distribution": dict(
+            Counter(item["source_resolution"] for item in all_influence_facts)
+        ),
         "generation_type_distribution": dict(
             Counter(item.get("generation_type", "") for item in all_facts if item.get("generation_type"))
         ),
@@ -744,6 +994,7 @@ def main() -> None:
         "skipped_reason_distribution": dict(Counter(item["reason"] for item in all_skipped)),
         "inferred_ctas_schema_count": len(inferred_columns),
         "facts_path": str(facts_path),
+        "influence_path": str(influence_path),
         "errors_path": str(errors_path),
         "skipped_path": str(skipped_path),
     }

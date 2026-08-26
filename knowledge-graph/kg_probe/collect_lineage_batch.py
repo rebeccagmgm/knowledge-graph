@@ -47,6 +47,16 @@ def parse_tasks(value: str | None, task_file: str | None) -> list[str]:
     return DEFAULT_TASKS
 
 
+def manifest_payload(requested_tasks: list[str], summaries: list[dict], **extra) -> dict:
+    payload = {
+        "task_count": len(summaries),
+        "requested_task_count": len(requested_tasks),
+        "summaries": summaries,
+    }
+    payload.update(extra)
+    return payload
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", default=None)
@@ -60,7 +70,6 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Refresh lineage even when a snapshot exists")
     args = parser.parse_args()
 
-    api = init_api()
     tasks = parse_tasks(args.tasks, args.task_file)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -79,10 +88,23 @@ def main() -> None:
             done.add(task_id)
 
     try:
+        api = None
+        relation_cache: dict[str, list[dict]] = {}
         for task_id in tasks:
             if task_id in done:
+                cached = next((item for item in summaries if item.get("task_id") == task_id), None)
+                if cached:
+                    print(
+                        json.dumps(
+                            {"task_id": task_id, "status": "cached", **cached},
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
                 continue
             try:
+                if api is None:
+                    api = init_api()
                 graph = collect_upstream_graph(
                     api,
                     task_id,
@@ -91,28 +113,36 @@ def main() -> None:
                     args.sleep,
                     retries=args.retries,
                     backoff_sec=args.backoff,
+                    relation_cache=relation_cache,
                 )
                 path = output_root / f"{task_id}_lineage.json"
                 write_json(path, graph)
                 summary = {
                     "task_id": task_id,
                     "path": str(path),
+                    "relation_cache_size": len(relation_cache),
                     **graph["summary"],
                 }
             except Exception as exc:  # noqa: BLE001
                 summary = {"task_id": task_id, "error": str(exc)}
             summaries.append(summary)
-            manifest = {"task_count": len(tasks), "summaries": summaries}
-            write_json(manifest_path, manifest)
+            write_json(manifest_path, manifest_payload(tasks, summaries))
             print(json.dumps(summary, ensure_ascii=False), flush=True)
     except KeyboardInterrupt:
-        manifest = {"task_count": len(tasks), "summaries": summaries, "interrupted": True}
-        write_json(manifest_path, manifest)
+        write_json(manifest_path, manifest_payload(tasks, summaries, interrupted=True))
         raise
 
-    manifest = {"task_count": len(tasks), "summaries": summaries}
-    write_json(manifest_path, manifest)
-    print(json.dumps({"manifest_path": str(manifest_path), "task_count": len(tasks)}, ensure_ascii=False))
+    write_json(manifest_path, manifest_payload(tasks, summaries))
+    print(
+        json.dumps(
+            {
+                "manifest_path": str(manifest_path),
+                "task_count": len(summaries),
+                "requested_task_count": len(tasks),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

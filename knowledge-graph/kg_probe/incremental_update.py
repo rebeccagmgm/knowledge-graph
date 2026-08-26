@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +76,46 @@ def normalize_sql(text: str, dialect: str = "spark") -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
+def normalize_runtime_sql(text: str) -> str:
+    """Mask volatile run-date literals emitted into Hive runtime SQL."""
+    text = re.sub(
+        r"(?i)(\bBUSI_DATE\s*=\s*)'?\d{4}-\d{2}-\d{2}'?",
+        r"\1'__RUN_DATE__'",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(\bDATA_(?:ETL|UPT)_DATE\s*(?:=|AS)?\s*)'?\d{4}-\d{2}-\d{2}'?",
+        r"\1'__RUN_DATE__'",
+        text,
+    )
+    text = re.sub(
+        r"(?i)'?\d{4}-\d{2}-\d{2}'?(\s+AS\s+DATA_(?:ETL|UPT)_DATE\b)",
+        r"'__RUN_DATE__'\1",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(\bDATA_TIME\s*(?:=|AS)?\s*)'?\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}'?",
+        r"\1'__RUN_TS__'",
+        text,
+    )
+    text = re.sub(
+        r"(?i)'?\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}'?(\s+AS\s+DATA_TIME\b)",
+        r"'__RUN_TS__'\1",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(\bLOAD_TIME\s*(?:=|AS)?\s*)'?\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}'?",
+        r"\1'__RUN_TS__'",
+        text,
+    )
+    text = re.sub(
+        r"(?i)'?\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}'?(\s+AS\s+LOAD_TIME\b)",
+        r"'__RUN_TS__'\1",
+        text,
+    )
+    return text
+
+
 def read_artifact_text(item: dict, project_dir: Path) -> str:
     raw_path = item.get("statement_path") or item.get("path")
     if not raw_path:
@@ -85,6 +126,12 @@ def read_artifact_text(item: dict, project_dir: Path) -> str:
     if not path.exists():
         return item.get("sql", "")
     return path.read_text(errors="replace")
+
+
+def semantic_sql_for_artifact(text: str, source: str, dialect: str = "spark") -> str:
+    if source == "runtime_log":
+        text = normalize_runtime_sql(text)
+    return normalize_sql(text, dialect)
 
 
 def task_code_fingerprints(project_dir: Path, dialect: str = "spark") -> dict[str, dict]:
@@ -101,12 +148,13 @@ def task_code_fingerprints(project_dir: Path, dialect: str = "spark") -> dict[st
         if not task_id:
             continue
         text = read_artifact_text(item, project_dir)
+        source = item.get("strategy_source") or item.get("source_type") or "unknown"
         grouped[task_id].append(
             {
-                "source": item.get("strategy_source") or item.get("source_type") or "unknown",
+                "source": source,
                 "name": item.get("prop_name") or item.get("statement_index") or item.get("artifact_id"),
                 "raw": text,
-                "semantic": normalize_sql(text, dialect),
+                "semantic": semantic_sql_for_artifact(text, source, dialect),
             }
         )
 
@@ -325,16 +373,40 @@ def mark_manual_overrides(project_dir: Path, metric_ids: set[str], detected_at: 
     return changed
 
 
+def progress(event: str, **fields) -> None:
+    payload = {"event": event, **fields}
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
 def run_command(name: str, cmd: list[str], dry_run: bool = False) -> dict:
+    started = time.monotonic()
+    progress("step_started", step=name, cmd=cmd, dry_run=dry_run)
     if dry_run:
-        return {"step": name, "returncode": 0, "dry_run": True, "cmd": cmd}
+        result = {
+            "step": name,
+            "returncode": 0,
+            "dry_run": True,
+            "cmd": cmd,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+        progress("step_finished", step=name, returncode=0, elapsed_seconds=result["elapsed_seconds"])
+        return result
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
     result = {
         "step": name,
         "returncode": proc.returncode,
         "stdout_tail": proc.stdout.splitlines()[-3:],
         "stderr_tail": proc.stderr.splitlines()[-3:],
+        "elapsed_seconds": round(time.monotonic() - started, 3),
     }
+    progress(
+        "step_finished",
+        step=name,
+        returncode=proc.returncode,
+        elapsed_seconds=result["elapsed_seconds"],
+        stdout_tail=result["stdout_tail"],
+        stderr_tail=result["stderr_tail"],
+    )
     if proc.returncode != 0:
         raise RuntimeError(f"{name} failed: {result['stderr_tail']}")
     return result
@@ -373,8 +445,11 @@ def refresh_inputs(config: dict, project_dir: Path, output_root: Path, lineage_r
     tasks = [str(x) for x in config.get("result_task_ids", []) + config.get("supplemental_task_ids", [])]
     options = config.get("options", {})
     project_lineage_root = lineage_root / project_id
+    refresh_lineage_cmd = [py, str(script_dir / "collect_lineage_batch.py"), "--tasks", ",".join(tasks), "--max-depth", str(options.get("max_depth", 25)), "--max-nodes", str(options.get("max_nodes", 3000)), "--output-root", str(project_lineage_root)]
+    if options.get("force_lineage_refresh", True):
+        refresh_lineage_cmd.append("--force")
     commands = [
-        ("refresh_lineage", [py, str(script_dir / "collect_lineage_batch.py"), "--tasks", ",".join(tasks), "--max-depth", str(options.get("max_depth", 25)), "--max-nodes", str(options.get("max_nodes", 3000)), "--output-root", str(project_lineage_root), "--force"]),
+        ("refresh_lineage", refresh_lineage_cmd),
         ("merge_lineage", [py, str(script_dir / "merge_lineage_project.py"), "--project-id", project_id, "--tasks", ",".join(tasks), "--lineage-root", str(project_lineage_root), "--output-root", str(output_root)]),
         ("refresh_details", [py, str(script_dir / "collect_details.py"), str(project_dir), "--force"]),
         ("refresh_page_code", [py, str(script_dir / "collect_page_code.py"), str(project_dir), "--force"]),

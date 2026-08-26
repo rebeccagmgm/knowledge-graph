@@ -45,13 +45,31 @@ LABEL_PRIORITY = [
 TRACE_RELATIONS = {
     "schedule_task": "DEPENDS_ON",
     "dataset": "DATASET_DEPENDS_ON",
-    "column": "DERIVED_FROM",
+    "column": "DERIVED_FROM|INFLUENCED_BY",
     "metric": "STORED_IN|COMPUTED_BY|DATASET_DEPENDS_ON|DEPENDS_ON",
 }
 
 COMPARE_BRANCH_BATCH_SIZE = 10
 COMPARE_MEMORY_ERROR_CODE = "Neo.TransientError.General.MemoryPoolOutOfMemoryError"
 COMPARE_QUERY_TIMEOUT_SECONDS = 30.0
+GRAPH_RELATION_PROFILES = {
+    "schedule": {"DEPENDS_ON"},
+    "dataset_lineage": {"DATASET_DEPENDS_ON", "PRODUCES", "CONSUMES", "READS", "WRITES"},
+    "column_lineage": {"HAS_COLUMN", "DERIVED_FROM", "INFLUENCED_BY"},
+    "code": {"EMITS_SQL", "READS", "WRITES", "PRODUCES", "CONSUMES"},
+    "metric": {"STORED_IN", "COMPUTED_BY", "HAS_DEFINITION", "HAS_CODE_DEFINITION", "HAS_COMPARISON"},
+    "lineage": {
+        "DEPENDS_ON", "PRODUCES", "CONSUMES", "EMITS_SQL", "READS", "WRITES",
+        "DATASET_DEPENDS_ON", "HAS_COLUMN", "DERIVED_FROM", "INFLUENCED_BY",
+        "STORED_IN", "COMPUTED_BY",
+    },
+    "all_safe": {
+        "DEPENDS_ON", "PRODUCES", "CONSUMES", "EMITS_SQL", "READS", "WRITES",
+        "DATASET_DEPENDS_ON", "HAS_COLUMN", "DERIVED_FROM", "INFLUENCED_BY",
+        "STORED_IN", "COMPUTED_BY", "HAS_DEFINITION", "HAS_CODE_DEFINITION", "HAS_COMPARISON",
+    },
+}
+GRAPH_ALLOWED_RELATIONS = set().union(*GRAPH_RELATION_PROFILES.values())
 
 CHANGE_TYPES = {"drop", "rename", "type_change", "logic_change", "stop_production", "schedule_change"}
 ISSUE_TYPES = {"conflict", "partially_consistent", "code_evidence_insufficient", "registry_missing", "manual_review_required", "consistent"}
@@ -119,7 +137,7 @@ class QueryService:
         "search_entities", "resolve_entity", "get_metric_context", "get_task_context",
         "get_dataset_context", "get_column_context", "trace_upstream", "trace_downstream",
         "analyze_impact", "compare_metric_definitions", "find_definition_issues",
-        "explain_lineage_path", "compare_branches",
+            "explain_lineage_path", "compare_branches", "get_recent_changes", "get_graph_neighborhood",
     }
 
     def __init__(self, store, project_id: str = "trial_project", project_dir: str | Path | None = None):
@@ -1002,6 +1020,28 @@ class QueryService:
         q = query.strip().lower()
         if not q:
             raise ValueError("query is required")
+        exact_rows = self.store.query(
+            """
+            MATCH (n:KGNode {project_key: $project_id})
+            WHERE any(label IN labels(n) WHERE label IN $labels)
+              AND (
+                toLower(n.id) = $query OR
+                toLower(coalesce(toString(n.original_id), '')) = $query OR
+                toLower(coalesce(toString(n.name), '')) = $query OR
+                toLower(coalesce(toString(n.task_id), '')) = $query OR
+                toLower(coalesce(toString(n.metric_id), '')) = $query OR
+                toLower(coalesce(toString(n.chinese_name), '')) = $query OR
+                toLower(coalesce(toString(n.english_name), '')) = $query OR
+                toLower(coalesce(toString(n.task_name), '')) = $query
+              )
+            RETURN n, 1.0 AS score, 'exact' AS match_method
+            ORDER BY n.id
+            LIMIT $limit
+            """,
+            {"project_id": project_id, "labels": labels, "query": q, "limit": limit},
+        )
+        if exact_rows:
+            return exact_rows
         fulltext_query = " ".join(token for token in FULLTEXT_SAFE.split(query.strip()) if token)
         if fulltext_query:
             try:
@@ -1011,8 +1051,14 @@ class QueryService:
                     WHERE node:KGNode
                       AND node.project_key = $project_id
                       AND any(label IN labels(node) WHERE label IN $labels)
-                    RETURN node AS n, score
-                    ORDER BY score DESC, node.id
+                    WITH node, score AS raw_score
+                    WITH node, raw_score, CASE
+                      WHEN raw_score >= 20 THEN 0.9
+                      WHEN raw_score >= 10 THEN 0.8
+                      WHEN raw_score >= 5 THEN 0.7
+                      ELSE 0.6 END AS normalized_score
+                    RETURN node AS n, normalized_score AS score, raw_score, 'fulltext' AS match_method
+                    ORDER BY score DESC, raw_score DESC, node.id
                     LIMIT $limit
                     """,
                     {
@@ -1051,7 +1097,11 @@ class QueryService:
               WHEN toLower(coalesce(toString(n.name), '')) STARTS WITH $query
                 OR toLower(coalesce(toString(n.chinese_name), '')) STARTS WITH $query THEN 0.8
               ELSE 0.6 END AS score
-            RETURN n, score
+            WITH n, score, CASE
+              WHEN score >= 0.95 THEN 'exact'
+              WHEN score >= 0.8 THEN 'prefix'
+              ELSE 'contains' END AS match_method
+            RETURN n, score, match_method
             ORDER BY score DESC, n.id
             LIMIT $limit
             """,
@@ -1069,7 +1119,12 @@ class QueryService:
         matches = []
         for row in rows:
             item = entity_ref(row["n"], req["include_properties"])
-            item["match"] = {"score": row["score"], "method": "exact" if row["score"] >= 0.95 else "fuzzy"}
+            item["match"] = {
+                "score": row["score"],
+                "method": row.get("match_method") or ("exact" if row["score"] >= 0.95 else "fuzzy"),
+            }
+            if row.get("raw_score") is not None:
+                item["match"]["raw_score"] = row["raw_score"]
             entities.append(item)
             matches.append({"entity_id": item["entity_id"], **item["match"]})
         if not entities:
@@ -1118,16 +1173,134 @@ class QueryService:
             return exact[0]["n"], []
         if len(rows) == 1:
             return rows[0]["n"], []
-        return None, [entity_ref(row["n"], req["include_properties"]) for row in rows]
+        return None, self._enrich_candidate_refs([row["n"] for row in rows], req)
 
     def resolve_entity(self, req: dict) -> dict:
         node, candidates = self._resolve_subject(req)
         if node:
             entity = entity_ref(node, req["include_properties"])
-            return response("resolve_entity", answer=f"已解析为{entity['display_name']}。", data={"resolved_entity_id": entity["entity_id"]}, entities=[entity])
+            context = self._disambiguation_context(node, req["project_id"])
+            if context:
+                entity["disambiguation_context"] = context
+            return response(
+                "resolve_entity",
+                answer=f"已解析为{entity['display_name']}。",
+                data={"resolved_entity_id": entity["entity_id"], "context": context},
+                entities=[entity],
+            )
         if candidates:
-            return response("resolve_entity", status="ambiguous", answer="输入对应多个候选实体。", entities=candidates, warnings=[warning("ENTITY_AMBIGUOUS", "请补充实体类型或所属表等上下文。")])
+            needed = self._clarification_fields(candidates)
+            return response(
+                "resolve_entity",
+                status="ambiguous",
+                answer="输入对应多个候选实体，需要补充上下文后再执行后续查询。",
+                data={
+                    "candidate_count": len(candidates),
+                    "clarification": {
+                        "needed_context": needed,
+                        "question": self._clarification_question(needed),
+                    },
+                },
+                entities=candidates,
+                warnings=[warning("ENTITY_AMBIGUOUS", "请补充实体类型、所属表、任务 ID 或指标 ID 等上下文。")],
+            )
         return response("resolve_entity", status="not_found", answer="未找到目标实体。")
+
+    def _disambiguation_context(self, node: dict, project_id: str) -> dict:
+        entity_type = _node_type(node)
+        if entity_type == "column":
+            rows = self.store.query(
+                """
+                MATCH (d:Dataset {project_key: $project_id})-[:HAS_COLUMN]->(c:Column {id: $id})
+                OPTIONAL MATCH (producer:ScheduleTask {project_key: $project_id})-[:PRODUCES]->(d)
+                OPTIONAL MATCH (metric:Metric {project_key: $project_id})-[:STORED_IN]->(d)
+                RETURN d, collect(DISTINCT producer.task_id)[0..5] AS producer_task_ids,
+                       collect(DISTINCT metric.metric_id)[0..5] AS metric_ids
+                LIMIT 1
+                """,
+                {"project_id": project_id, "id": node["id"]},
+            )
+            if not rows:
+                return {}
+            dataset = rows[0].get("d") or {}
+            props = dataset.get("properties", {})
+            return {
+                "dataset_id": dataset.get("id"),
+                "dataset_name": props.get("name"),
+                "dataset_layer": props.get("layer"),
+                "producer_task_ids": [x for x in rows[0].get("producer_task_ids", []) if x],
+                "metric_ids": [x for x in rows[0].get("metric_ids", []) if x],
+            }
+        if entity_type == "dataset":
+            rows = self.store.query(
+                """
+                MATCH (d:Dataset {id: $id, project_key: $project_id})
+                OPTIONAL MATCH (producer:ScheduleTask {project_key: $project_id})-[:PRODUCES]->(d)
+                OPTIONAL MATCH (consumer:ScheduleTask {project_key: $project_id})-[:CONSUMES]->(d)
+                OPTIONAL MATCH (metric:Metric {project_key: $project_id})-[:STORED_IN]->(d)
+                RETURN collect(DISTINCT producer.task_id)[0..5] AS producer_task_ids,
+                       collect(DISTINCT consumer.task_id)[0..5] AS consumer_task_ids,
+                       collect(DISTINCT metric.metric_id)[0..5] AS metric_ids
+                """,
+                {"project_id": project_id, "id": node["id"]},
+            )
+            return rows[0] if rows else {}
+        if entity_type == "schedule_task":
+            props = node.get("properties", {})
+            return {
+                "task_id": props.get("task_id"),
+                "task_type": props.get("task_type"),
+                "task_name": props.get("task_name"),
+                "layer": props.get("layer"),
+                "owner": props.get("owner") or props.get("owners"),
+            }
+        if entity_type == "metric":
+            props = node.get("properties", {})
+            return {
+                "metric_id": props.get("metric_id"),
+                "chinese_name": props.get("chinese_name"),
+                "english_name": props.get("english_name"),
+                "dataset": props.get("dataset"),
+            }
+        return {}
+
+    def _enrich_candidate_refs(self, nodes: list[dict], req: dict) -> list[dict]:
+        result = []
+        for node in nodes:
+            item = entity_ref(node, req["include_properties"])
+            context = self._disambiguation_context(node, req["project_id"])
+            if context:
+                item["disambiguation_context"] = context
+            result.append(item)
+        return result
+
+    def _clarification_fields(self, candidates: list[dict]) -> list[str]:
+        types = {item.get("entity_type") for item in candidates}
+        if types == {"column"}:
+            return ["dataset_name", "task_id", "metric_id"]
+        if types == {"dataset"}:
+            return ["dataset_full_name", "layer", "producer_task_id"]
+        if types == {"schedule_task"}:
+            return ["task_id", "task_name"]
+        if types == {"metric"}:
+            return ["metric_id", "metric_name", "storage_dataset"]
+        return ["entity_type", "dataset_name", "task_id", "metric_id"]
+
+    def _clarification_question(self, fields: list[str]) -> str:
+        labels = {
+            "dataset_name": "字段所属表",
+            "task_id": "任务 ID",
+            "metric_id": "指标 ID",
+            "dataset_full_name": "完整表名",
+            "layer": "数据层级",
+            "producer_task_id": "生产任务 ID",
+            "task_name": "任务名称",
+            "metric_name": "指标名称",
+            "storage_dataset": "指标存储表",
+            "entity_type": "实体类型",
+        }
+        readable = "、".join(labels.get(field, field) for field in fields)
+        return f"请补充{readable}以消除歧义。"
 
     def _ambiguity_or_not_found(self, primitive: str, candidates: list[dict]) -> dict:
         if candidates:
@@ -1164,6 +1337,22 @@ class QueryService:
             return None
         for item in json.loads(path.read_text()):
             if str(item.get("metric_id")) == metric_id:
+                return item
+        return None
+
+    def _local_asset_summary(self, asset_type: str, key: str) -> dict | None:
+        if not self.project_dir or not key:
+            return None
+        filename = "task_summaries.jsonl" if asset_type == "task" else "dataset_summaries.jsonl"
+        path = self.project_dir / "llm" / filename
+        if not path.exists():
+            return None
+        key_fields = ["task_id", "task_node_id"] if asset_type == "task" else ["dataset", "dataset_id", "name"]
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if any(str(item.get(field, "")) == str(key) for field in key_fields):
                 return item
         return None
 
@@ -1254,6 +1443,8 @@ class QueryService:
         row = rows[0]
         entities = [entity_ref(x, req["include_properties"]) for key in row for x in (row[key] if isinstance(row[key], list) else [row[key]]) if isinstance(x, dict) and x.get("id")]
         data = {key: [x.get("id") for x in value if x] for key, value in row.items() if isinstance(value, list)}
+        task_id = str(node.get("properties", {}).get("task_id") or "")
+        data["summary"] = self._local_asset_summary("task", task_id) or self._local_asset_summary("task", node["id"])
         return response("get_task_context", answer=f"任务{node['properties'].get('task_id')}上下文查询完成。", data=data, entities=_dedupe_entities(entities), evidence=self._sql_evidence([x for x in row["sql"] if x]) if req["include_evidence"] else [])
 
     def get_dataset_context(self, req: dict) -> dict:
@@ -1279,6 +1470,8 @@ class QueryService:
         row = rows[0]
         entities = [entity_ref(x, req["include_properties"]) for key in row for x in (row[key] if isinstance(row[key], list) else [row[key]]) if isinstance(x, dict) and x.get("id")]
         data = {key: [x.get("id") for x in value if x] for key, value in row.items() if isinstance(value, list)}
+        dataset_name = str(node.get("properties", {}).get("name") or "")
+        data["summary"] = self._local_asset_summary("dataset", dataset_name) or self._local_asset_summary("dataset", node["id"])
         return response("get_dataset_context", answer=f"表“{_display_name(node)}”上下文查询完成。", data=data, entities=_dedupe_entities(entities))
 
     def get_column_context(self, req: dict) -> dict:
@@ -1320,6 +1513,7 @@ class QueryService:
             "excerpt": "",
             "source_type": props.get("source_type"),
             "derivation": props.get("source_resolution") or props.get("fact_type"),
+            "influence_type": props.get("influence_type"),
             "confidence": props.get("confidence", "medium"),
             "build_id": props.get("build_id"),
         }
@@ -1343,6 +1537,7 @@ class QueryService:
                 "task_id": edge.get("properties", {}).get("task_id"),
                 "statement_id": edge.get("properties", {}).get("statement_id"),
                 "source_type": edge.get("properties", {}).get("source_type"),
+                "influence_type": edge.get("properties", {}).get("influence_type"),
             } for edge in edges],
         }
         entities = [entity_ref(node, include_properties) for node in nodes]
@@ -1465,13 +1660,13 @@ class QueryService:
             "hops": req["max_hops"],
             "limit": req["limit"],
         }
+        hops = int(req["max_hops"])
         if entity_type == "column":
             rows = self.store.query(
                 """
                 MATCH (subject:Column {id: $id, project_key: $project_id})
                 OPTIONAL MATCH (subject_dataset:Dataset {project_key: $project_id})-[:HAS_COLUMN]->(subject)
-                OPTIONAL MATCH path=(subject)<-[:DERIVED_FROM*1..50]-(down_col:Column {project_key: $project_id})
-                WHERE length(path) <= $hops
+                OPTIONAL MATCH path=(subject)<-[:DERIVED_FROM|INFLUENCED_BY*1..__HOPS__]-(down_col:Column {project_key: $project_id})
                 WITH subject, collect(DISTINCT subject_dataset) AS subject_datasets, collect(DISTINCT down_col) AS affected_columns
                 OPTIONAL MATCH (affected_dataset:Dataset {project_key: $project_id})-[:HAS_COLUMN]->(affected_column:Column)
                 WHERE affected_column IN affected_columns
@@ -1489,8 +1684,7 @@ class QueryService:
                 OPTIONAL MATCH (metric:Metric {project_key: $project_id})-[:STORED_IN]->(metric_dataset:Dataset)
                 WHERE metric_dataset IN affected_datasets
                 WITH subject, affected_columns, affected_datasets, producer_tasks + consumer_tasks + sql_consumer_tasks AS impact_tasks, collect(DISTINCT metric) AS metrics
-                OPTIONAL MATCH (subject)<-[rels:DERIVED_FROM*1..50]-(:Column {project_key: $project_id})
-                WHERE size(rels) <= $hops
+                OPTIONAL MATCH (subject)<-[rels:DERIVED_FROM|INFLUENCED_BY*1..__HOPS__]-(:Column {project_key: $project_id})
                 UNWIND rels AS rel
                 WITH subject, affected_columns, affected_datasets, impact_tasks, metrics,
                      collect(DISTINCT rel.task_id) AS lineage_task_ids
@@ -1502,15 +1696,14 @@ class QueryService:
                        impact_tasks AS producer_tasks,
                        collect(DISTINCT lineage_task) AS lineage_tasks,
                        metrics
-                """,
+                """.replace("__HOPS__", str(hops)),
                 params,
             )
         elif entity_type == "dataset":
             rows = self.store.query(
                 """
                 MATCH (subject:Dataset {id: $id, project_key: $project_id})
-                OPTIONAL MATCH path=(subject)<-[:DATASET_DEPENDS_ON*1..50]-(down_dataset:Dataset {project_key: $project_id})
-                WHERE length(path) <= $hops
+                OPTIONAL MATCH path=(subject)<-[:DATASET_DEPENDS_ON*1..__HOPS__]-(down_dataset:Dataset {project_key: $project_id})
                 WITH subject, collect(DISTINCT down_dataset) AS affected_datasets
                 OPTIONAL MATCH (producer:ScheduleTask {project_key: $project_id})-[:PRODUCES]->(produced:Dataset)
                 WHERE produced IN affected_datasets
@@ -1530,15 +1723,14 @@ class QueryService:
                        producer_tasks,
                        [] AS lineage_tasks,
                        collect(DISTINCT metric) AS metrics
-                """,
+                """.replace("__HOPS__", str(hops)),
                 params,
             )
         elif entity_type == "schedule_task":
             rows = self.store.query(
                 """
                 MATCH (subject:ScheduleTask {id: $id, project_key: $project_id})
-                OPTIONAL MATCH path=(subject)<-[:DEPENDS_ON*1..50]-(down_task:ScheduleTask {project_key: $project_id})
-                WHERE length(path) <= $hops
+                OPTIONAL MATCH path=(subject)<-[:DEPENDS_ON*1..__HOPS__]-(down_task:ScheduleTask {project_key: $project_id})
                 WITH subject, collect(DISTINCT down_task) AS affected_tasks
                 OPTIONAL MATCH (task:ScheduleTask {project_key: $project_id})-[:PRODUCES]->(dataset:Dataset)
                 WHERE task = subject OR task IN affected_tasks
@@ -1551,7 +1743,7 @@ class QueryService:
                        affected_tasks AS producer_tasks,
                        [] AS lineage_tasks,
                        collect(DISTINCT metric) AS metrics
-                """,
+                """.replace("__HOPS__", str(hops)),
                 params,
             )
         else:
@@ -1596,6 +1788,123 @@ class QueryService:
         }
         return data, list(entity_by_id.values())
 
+    def _impact_groups(self, node: dict, req: dict) -> list[dict]:
+        entity_type = _node_type(node)
+        if entity_type == "column":
+            hops = int(req["max_hops"])
+            rows = self.store.query(
+                """
+                MATCH (subject:Column {id: $id, project_key: $project_id})
+                OPTIONAL MATCH path=(subject)<-[rels:DERIVED_FROM|INFLUENCED_BY*1..__HOPS__]-(down_col:Column {project_key: $project_id})
+                UNWIND rels AS rel
+                WITH down_col, rel, CASE
+                  WHEN type(rel) = 'DERIVED_FROM' THEN 'direct_value_lineage'
+                  ELSE coalesce(rel.influence_type, 'indirect_context_influence') END AS reason
+                OPTIONAL MATCH (dataset:Dataset {project_key: $project_id})-[:HAS_COLUMN]->(down_col)
+                RETURN reason,
+                       count(DISTINCT down_col) AS affected_column_count,
+                       count(DISTINCT dataset) AS affected_dataset_count,
+                       collect(DISTINCT rel.task_id)[0..20] AS sample_task_ids,
+                       collect(DISTINCT down_col.id)[0..20] AS sample_column_ids,
+                       collect(DISTINCT rel.statement_id)[0..10] AS sample_statement_ids
+                ORDER BY affected_column_count DESC, reason
+                """.replace("__HOPS__", str(hops)),
+                {"id": node["id"], "project_id": req["project_id"], "hops": req["max_hops"]},
+            )
+            return [self._impact_group_payload(row) for row in rows if row.get("reason")]
+        if entity_type == "dataset":
+            return [
+                {
+                    "group": "dataset_downstream_lineage",
+                    "severity": "high",
+                    "reason": "表级下游血缘或消费关系受影响。",
+                    "affected_dataset_count": 0,
+                    "affected_column_count": 0,
+                    "affected_task_count": 0,
+                    "sample_task_ids": [],
+                    "sample_column_ids": [],
+                    "sample_statement_ids": [],
+                }
+            ]
+        if entity_type == "schedule_task":
+            return [
+                {
+                    "group": "schedule_downstream_lineage",
+                    "severity": "high",
+                    "reason": "调度下游任务、产出表和指标可能受影响。",
+                    "affected_dataset_count": 0,
+                    "affected_column_count": 0,
+                    "affected_task_count": 0,
+                    "sample_task_ids": [],
+                    "sample_column_ids": [],
+                    "sample_statement_ids": [],
+                }
+            ]
+        return []
+
+    def _impact_group_payload(self, row: dict) -> dict:
+        reason = row.get("reason")
+        severity_by_reason = {
+            "direct_value_lineage": "high",
+            "filter": "medium",
+            "join_condition": "medium",
+            "join_using": "medium",
+            "group_by": "medium",
+            "having": "medium",
+            "qualify": "medium",
+            "order_by": "low",
+            "indirect_context_influence": "medium",
+        }
+        description_by_reason = {
+            "direct_value_lineage": "字段作为下游字段值的直接来源，通常需要检查字段删除、改名、类型和口径变更。",
+            "filter": "字段参与过滤条件，会影响结果集范围。",
+            "join_condition": "字段参与关联条件，会影响数据匹配关系。",
+            "join_using": "字段参与 USING 关联，会影响数据匹配关系。",
+            "group_by": "字段参与分组，会影响聚合粒度。",
+            "having": "字段参与聚合后过滤，会影响结果集范围。",
+            "qualify": "字段参与窗口结果过滤，会影响结果集范围。",
+            "order_by": "字段参与排序，通常影响排序或窗口相关逻辑。",
+            "indirect_context_influence": "字段通过上下文关系间接影响下游。",
+        }
+        return {
+            "group": reason,
+            "severity": severity_by_reason.get(reason, "medium"),
+            "reason": description_by_reason.get(reason, "字段影响下游逻辑。"),
+            "affected_column_count": row.get("affected_column_count", 0),
+            "affected_dataset_count": row.get("affected_dataset_count", 0),
+            "sample_task_ids": [x for x in row.get("sample_task_ids", []) if x],
+            "sample_column_ids": [x for x in row.get("sample_column_ids", []) if x],
+            "sample_statement_ids": [x for x in row.get("sample_statement_ids", []) if x],
+        }
+
+    def _impact_explanations(self, paths: list[dict], groups: list[dict]) -> list[dict]:
+        explanations = []
+        for group in groups:
+            explanations.append(
+                {
+                    "group": group["group"],
+                    "severity": group["severity"],
+                    "explanation": group["reason"],
+                    "sample_task_ids": group.get("sample_task_ids", [])[:5],
+                    "sample_column_ids": group.get("sample_column_ids", [])[:5],
+                    "sample_statement_ids": group.get("sample_statement_ids", [])[:3],
+                }
+            )
+        for path in paths[:5]:
+            relation_types = [edge.get("type") for edge in path.get("edges", [])]
+            influence_types = [edge.get("influence_type") for edge in path.get("edges", []) if edge.get("influence_type")]
+            explanations.append(
+                {
+                    "group": "sample_path",
+                    "severity": path.get("confidence", "medium"),
+                    "explanation": "代表路径说明影响如何沿图关系传播。",
+                    "path_id": path.get("path_id"),
+                    "relation_types": relation_types,
+                    "influence_types": influence_types,
+                }
+            )
+        return explanations
+
     def analyze_impact(self, req: dict) -> dict:
         change_type = req.get("change_type", "logic_change")
         if change_type not in CHANGE_TYPES:
@@ -1605,6 +1914,7 @@ class QueryService:
             return self._ambiguity_or_not_found("analyze_impact", candidates)
         aggregate, aggregate_entities = self._impact_aggregate(node, req)
         paths, path_entities, evidence = self._impact_sample_paths(node, req)
+        impact_groups = self._impact_groups(node, req)
         entities = [entity_ref(node, req["include_properties"])] + aggregate_entities + path_entities
         warns = []
         include_fallback = bool(req.get("include_sql_fallback")) or req["mode"] == "exploratory"
@@ -1631,6 +1941,8 @@ class QueryService:
             "subject": entity_ref(node, req["include_properties"]),
             "change_type": change_type,
             **aggregate,
+            "impact_groups": impact_groups,
+            "impact_explanations": self._impact_explanations(paths, impact_groups),
             "text_match_only": text_entities[: req["limit"]],
             "sample_path_count": len(paths),
         }
@@ -1753,13 +2065,318 @@ class QueryService:
             },
         )
 
+    def get_recent_changes(self, req: dict) -> dict:
+        if not self.project_dir:
+            return response(
+                "get_recent_changes",
+                status="partial",
+                answer="当前查询服务未配置项目产物目录，无法读取增量变化事件。",
+                warnings=[warning("PROJECT_DIR_UNAVAILABLE", "请为查询服务配置 project_dir 或 project_dir_root。")],
+            )
+        incremental_dir = self.project_dir / "incremental"
+        changes_dir = incremental_dir / "changes"
+        state_path = incremental_dir / "state.json"
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        files = sorted(changes_dir.glob("*.json"), key=lambda path: path.name, reverse=True) if changes_dir.exists() else []
+        offset = req["cursor_offset"]
+        limit = req["limit"]
+        selected = files[offset : offset + limit]
+        events = []
+        for path in selected:
+            item = json.loads(path.read_text())
+            events.append(
+                {
+                    "event_id": path.stem,
+                    "path": str(path),
+                    "project_id": item.get("project_id"),
+                    "detected_at": item.get("detected_at"),
+                    "semantic_change": bool(item.get("semantic_change")),
+                    "status": "changed" if item.get("semantic_change") else "unchanged",
+                    "added_task_count": len(item.get("added_task_ids", [])),
+                    "removed_task_count": len(item.get("removed_task_ids", [])),
+                    "metadata_changed_task_count": len(item.get("metadata_changed_task_ids", [])),
+                    "code_changed_task_count": len(item.get("code_changed_task_ids", [])),
+                    "text_only_changed_task_count": len(item.get("text_only_changed_task_ids", [])),
+                    "dependency_edges_added_count": len(item.get("dependency_edges_added", [])),
+                    "dependency_edges_removed_count": len(item.get("dependency_edges_removed", [])),
+                    "dataset_schema_changed": bool(item.get("dataset_schema_changed")),
+                    "indicator_registry_changed": bool(item.get("indicator_registry_changed")),
+                    "affected_task_count": len(item.get("affected_task_ids", [])),
+                    "affected_metric_count": len(item.get("affected_metric_ids", [])),
+                    "affected_task_ids_sample": item.get("affected_task_ids", [])[:20],
+                    "affected_metric_ids_sample": item.get("affected_metric_ids", [])[:20],
+                    "refresh_quality": item.get("refresh_quality", {}),
+                }
+            )
+        changed_count = sum(1 for path in files if json.loads(path.read_text()).get("semantic_change"))
+        data = {
+            "state": state,
+            "summary": {
+                "event_count": len(files),
+                "semantic_change_event_count": changed_count,
+                "last_scan_at": state.get("last_scan_at"),
+                "last_semantic_change": state.get("last_semantic_change"),
+                "last_change_path": state.get("last_change_path"),
+            },
+            "events": events,
+        }
+        has_more = offset + limit < len(files)
+        status = "ok" if events else "partial"
+        warns = [] if events else [warning("NO_CHANGE_EVENTS", "未找到增量变化事件文件。")]
+        return response(
+            "get_recent_changes",
+            status=status,
+            answer=f"读取到{len(files)}个增量变化事件，当前返回{len(events)}个。",
+            data=data,
+            warnings=warns,
+            page={
+                "limit": limit,
+                "returned": len(events),
+                "next_cursor": encode_cursor(offset + limit) if has_more else None,
+                "has_more": has_more,
+            },
+        )
+
+    def _graph_relation_types(self, req: dict) -> tuple[list[str], str]:
+        profile = str(req.get("relation_profile") or "lineage")
+        if profile not in GRAPH_RELATION_PROFILES:
+            raise ValueError(f"relation_profile must be one of {sorted(GRAPH_RELATION_PROFILES)}")
+        relation_types = req.get("edge_types") or sorted(GRAPH_RELATION_PROFILES[profile])
+        if isinstance(relation_types, str):
+            relation_types = [item.strip() for item in relation_types.split(",") if item.strip()]
+        relation_types = [str(item).strip().upper() for item in relation_types]
+        unsupported = sorted(set(relation_types) - GRAPH_ALLOWED_RELATIONS)
+        if unsupported:
+            raise ValueError(f"Unsupported edge_types: {unsupported}")
+        allowed_by_profile = GRAPH_RELATION_PROFILES[profile]
+        outside_profile = sorted(set(relation_types) - allowed_by_profile)
+        if outside_profile and not req.get("allow_custom_edge_types"):
+            raise ValueError(f"edge_types are outside relation_profile={profile}: {outside_profile}")
+        return sorted(set(relation_types)), profile
+
+    def _visual_node(self, node: dict, depth: int, include_properties: bool) -> dict:
+        ref = entity_ref(node, include_properties)
+        return {
+            "id": ref["entity_id"],
+            "type": ref["entity_type"],
+            "label": ref["display_name"],
+            "key": ref["key"],
+            "depth": depth,
+            "group": ref["entity_type"],
+            "properties": ref["properties"],
+        }
+
+    def _visual_edge(self, edge: dict, source: str, target: str) -> dict:
+        props = edge.get("properties", {})
+        raw = json.dumps([edge.get("id"), source, target, edge.get("type")], ensure_ascii=False)
+        return {
+            "id": f"ve:{hashlib.sha256(raw.encode()).hexdigest()[:16]}",
+            "source": source,
+            "target": target,
+            "type": edge.get("type"),
+            "label": edge.get("type"),
+            "graph_source": edge.get("from"),
+            "graph_target": edge.get("to"),
+            "confidence": props.get("confidence", "medium"),
+            "inferred": props.get("inferred", False),
+            "task_id": props.get("task_id"),
+            "statement_id": props.get("statement_id"),
+            "source_type": props.get("source_type"),
+            "influence_type": props.get("influence_type"),
+        }
+
+    def _neighborhood_step(
+        self,
+        frontier: set[str],
+        relation_types: list[str],
+        direction: str,
+        project_id: str,
+        limit: int,
+    ) -> list[dict]:
+        if not frontier or limit <= 0:
+            return []
+        relations = "|".join(relation_types)
+        params = {"project_id": project_id, "frontier": sorted(frontier), "limit": limit}
+        rows: list[dict] = []
+        if direction in {"upstream", "both"}:
+            rows.extend(
+                self.store.query(
+                    f"""
+                    MATCH (current:KGNode {{project_key: $project_id}})
+                    WHERE current.id IN $frontier
+                    MATCH (current)-[r:{relations}]->(neighbor:KGNode {{project_key: $project_id}})
+                    RETURN current, neighbor, r, 'out' AS traversal
+                    ORDER BY type(r), neighbor.id
+                    LIMIT $limit
+                    """,
+                    params,
+                )
+            )
+        if direction in {"downstream", "both"}:
+            rows.extend(
+                self.store.query(
+                    f"""
+                    MATCH (current:KGNode {{project_key: $project_id}})
+                    WHERE current.id IN $frontier
+                    MATCH (neighbor:KGNode {{project_key: $project_id}})-[r:{relations}]->(current)
+                    RETURN current, neighbor, r, 'in' AS traversal
+                    ORDER BY type(r), neighbor.id
+                    LIMIT $limit
+                    """,
+                    params,
+                )
+            )
+        deduped = {}
+        for row in rows:
+            edge = row.get("r") or {}
+            current = row.get("current") or {}
+            neighbor = row.get("neighbor") or {}
+            key = (current.get("id"), neighbor.get("id"), edge.get("id"), row.get("traversal"))
+            deduped.setdefault(key, row)
+        return list(deduped.values())[:limit]
+
+    def _edge_path_payload(self, edge: dict, source: str, target: str, direction: str) -> dict:
+        raw = json.dumps([source, target, edge.get("id"), edge.get("type")], ensure_ascii=False)
+        props = edge.get("properties", {})
+        return {
+            "path_id": f"path_{hashlib.sha256(raw.encode()).hexdigest()[:16]}",
+            "direction": direction,
+            "hop_count": 1,
+            "confidence": props.get("confidence", "medium"),
+            "nodes": [source, target],
+            "edges": [{
+                "type": edge.get("type"),
+                "from": edge.get("from"),
+                "to": edge.get("to"),
+                "confidence": props.get("confidence", "medium"),
+                "inferred": props.get("inferred", False),
+                "task_id": props.get("task_id"),
+                "statement_id": props.get("statement_id"),
+                "source_type": props.get("source_type"),
+                "influence_type": props.get("influence_type"),
+            }],
+        }
+
+    def get_graph_neighborhood(self, req: dict) -> dict:
+        node, candidates = self._resolve_subject(req)
+        if not node:
+            return self._ambiguity_or_not_found("get_graph_neighborhood", candidates)
+        direction = str(req.get("direction") or "downstream").lower()
+        if direction not in {"upstream", "downstream", "both"}:
+            raise ValueError("direction must be upstream, downstream, or both")
+        relation_types, profile = self._graph_relation_types(req)
+        hops = min(req["max_hops"], int(req.get("visual_max_hops", 8)))
+        limit_nodes = min(max(1, int(req.get("limit_nodes", req["limit"]))), 500)
+        limit_edges = min(max(1, int(req.get("limit_edges", limit_nodes * 3))), 1500)
+        visual_nodes: dict[str, dict] = {node["id"]: self._visual_node(node, 0, req["include_properties"])}
+        visual_edges: dict[tuple[str, str, str, str], dict] = {}
+        entities = [entity_ref(node, req["include_properties"])]
+        evidence = []
+        paths = []
+        source_path_count = 0
+        truncated = False
+        visited = {node["id"]}
+        frontier = {node["id"]}
+        per_step_limit = min(max(limit_edges, limit_nodes * 2), 500)
+        for depth in range(1, hops + 1):
+            if not frontier or len(visual_edges) >= limit_edges or len(visual_nodes) >= limit_nodes:
+                break
+            remaining_edges = limit_edges - len(visual_edges)
+            rows = self._neighborhood_step(
+                frontier,
+                relation_types,
+                direction,
+                req["project_id"],
+                min(per_step_limit, remaining_edges),
+            )
+            if not rows:
+                break
+            next_frontier = set()
+            for row in rows:
+                edge = row.get("r") or {}
+                current = row.get("current") or {}
+                neighbor = row.get("neighbor") or {}
+                current_id = current.get("id")
+                neighbor_id = neighbor.get("id")
+                if not current_id or not neighbor_id:
+                    continue
+                if len(visual_edges) >= limit_edges:
+                    truncated = True
+                    break
+                if current_id not in visual_nodes:
+                    if len(visual_nodes) >= limit_nodes:
+                        truncated = True
+                        continue
+                    visual_nodes[current_id] = self._visual_node(current, depth - 1, req["include_properties"])
+                    entities.append(entity_ref(current, req["include_properties"]))
+                if neighbor_id not in visual_nodes:
+                    if len(visual_nodes) >= limit_nodes:
+                        truncated = True
+                        continue
+                    visual_nodes[neighbor_id] = self._visual_node(neighbor, depth, req["include_properties"])
+                    entities.append(entity_ref(neighbor, req["include_properties"]))
+                else:
+                    visual_nodes[neighbor_id]["depth"] = min(visual_nodes[neighbor_id]["depth"], depth)
+                source = current_id
+                target = neighbor_id
+                key = (source, target, edge.get("type"), edge.get("id"))
+                if key not in visual_edges:
+                    visual_edges[key] = self._visual_edge(edge, source, target)
+                    source_path_count += 1
+                    paths.append(self._edge_path_payload(edge, source, target, direction))
+                    evidence.append(self._edge_evidence(edge))
+                if neighbor_id not in visited:
+                    next_frontier.add(neighbor_id)
+            visited.update(next_frontier)
+            frontier = next_frontier
+            if len(rows) >= min(per_step_limit, remaining_edges):
+                truncated = True
+        status = "partial" if truncated else "ok"
+        warns = []
+        if hops < req["max_hops"]:
+            warns.append(warning("MAX_HOPS_CAPPED", f"局部图展示深度已从{req['max_hops']}限制为{hops}。"))
+            status = "partial"
+        if truncated:
+            warns.append(warning("RESULT_TRUNCATED", "局部图按层展开时达到节点或关系上限，结果已截断。"))
+        if not visual_edges:
+            status = "partial"
+            warns.append(warning("NEIGHBORHOOD_EMPTY", "目标实体在当前关系范围内没有展开到邻接关系。", related_entity_ids=[node["id"]]))
+        visual_graph = {
+            "nodes": sorted(visual_nodes.values(), key=lambda item: (item["depth"], item["type"], item["id"])),
+            "edges": list(visual_edges.values()),
+        }
+        return response(
+            "get_graph_neighborhood",
+            status=status,
+            answer=f"围绕“{_display_name(node)}”展开了{len(visual_graph['nodes'])}个节点、{len(visual_graph['edges'])}条关系。",
+            data={
+                "center_entity_id": node["id"],
+                "direction": direction,
+                "max_hops": hops,
+                "relation_profile": profile,
+                "edge_types": relation_types,
+                "source_path_count": source_path_count,
+                "summary": {
+                    "node_count": len(visual_graph["nodes"]),
+                    "edge_count": len(visual_graph["edges"]),
+                    "truncated": truncated,
+                },
+                "visual_graph": visual_graph,
+            },
+            entities=_dedupe_entities(entities),
+            paths=paths[: min(req["limit"], 100)],
+            evidence=evidence[:limit_edges] if req["include_evidence"] else [],
+            warnings=warns,
+            page={"limit": limit_nodes, "returned": len(visual_graph["nodes"]), "next_cursor": None, "has_more": truncated},
+        )
+
     def explain_lineage_path(self, req: dict) -> dict:
         from_id = req.get("from_entity_id")
         to_id = req.get("to_entity_id")
         if not from_id or not to_id:
             raise ValueError("from_entity_id and to_entity_id are required")
         hops = req["max_hops"]
-        relations = "DEPENDS_ON|PRODUCES|CONSUMES|EMITS_SQL|READS|WRITES|DATASET_DEPENDS_ON|HAS_COLUMN|DERIVED_FROM|STORED_IN|COMPUTED_BY|HAS_DEFINITION|HAS_CODE_DEFINITION|HAS_COMPARISON"
+        relations = "DEPENDS_ON|PRODUCES|CONSUMES|EMITS_SQL|READS|WRITES|DATASET_DEPENDS_ON|HAS_COLUMN|DERIVED_FROM|INFLUENCED_BY|STORED_IN|COMPUTED_BY|HAS_DEFINITION|HAS_CODE_DEFINITION|HAS_COMPARISON"
         rows = self.store.query(
             f"MATCH (a:KGNode {{id: $from_id}}), (b:KGNode {{id: $to_id}}) MATCH p=shortestPath((a)-[:{relations}*..{hops}]-(b)) RETURN p LIMIT 1",
             {"from_id": from_id, "to_id": to_id},
